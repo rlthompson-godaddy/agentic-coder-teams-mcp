@@ -265,6 +265,167 @@ class TestWiring:
         assert inbox[0]["from"] == "team-lead"
 
 
+class TestTeamDeleteClearsSession:
+    async def test_should_allow_new_team_after_delete(self, client: Client):
+        await client.call_tool("team_create", {"team_name": "first"})
+        await client.call_tool("team_delete", {"team_name": "first"})
+        result = await client.call_tool("team_create", {"team_name": "second"})
+        data = _data(result)
+        assert data["team_name"] == "second"
+
+
+class TestSendMessageValidation:
+    async def test_should_reject_empty_content(self, client: Client):
+        await client.call_tool("team_create", {"team_name": "tv1"})
+        teams.add_member("tv1", _make_teammate("bob", "tv1"))
+        result = await client.call_tool(
+            "send_message",
+            {"team_name": "tv1", "type": "message", "recipient": "bob", "content": "", "summary": "hi"},
+            raise_on_error=False,
+        )
+        assert result.is_error is True
+        assert "content" in result.content[0].text.lower()
+
+    async def test_should_reject_empty_summary(self, client: Client):
+        await client.call_tool("team_create", {"team_name": "tv2"})
+        teams.add_member("tv2", _make_teammate("bob", "tv2"))
+        result = await client.call_tool(
+            "send_message",
+            {"team_name": "tv2", "type": "message", "recipient": "bob", "content": "hi", "summary": ""},
+            raise_on_error=False,
+        )
+        assert result.is_error is True
+        assert "summary" in result.content[0].text.lower()
+
+    async def test_should_reject_empty_recipient(self, client: Client):
+        await client.call_tool("team_create", {"team_name": "tv3"})
+        result = await client.call_tool(
+            "send_message",
+            {"team_name": "tv3", "type": "message", "recipient": "", "content": "hi", "summary": "hi"},
+            raise_on_error=False,
+        )
+        assert result.is_error is True
+        assert "recipient" in result.content[0].text.lower()
+
+    async def test_should_reject_nonexistent_recipient(self, client: Client):
+        await client.call_tool("team_create", {"team_name": "tv4"})
+        result = await client.call_tool(
+            "send_message",
+            {"team_name": "tv4", "type": "message", "recipient": "ghost", "content": "hi", "summary": "hi"},
+            raise_on_error=False,
+        )
+        assert result.is_error is True
+        assert "ghost" in result.content[0].text
+
+    async def test_should_pass_target_color(self, client: Client):
+        await client.call_tool("team_create", {"team_name": "tv5"})
+        teams.add_member("tv5", _make_teammate("bob", "tv5"))
+        result = await client.call_tool(
+            "send_message",
+            {"team_name": "tv5", "type": "message", "recipient": "bob", "content": "hey", "summary": "greet"},
+        )
+        data = _data(result)
+        assert data["routing"]["targetColor"] == "blue"
+
+    async def test_should_reject_broadcast_empty_summary(self, client: Client):
+        await client.call_tool("team_create", {"team_name": "tv6"})
+        result = await client.call_tool(
+            "send_message",
+            {"team_name": "tv6", "type": "broadcast", "content": "hello", "summary": ""},
+            raise_on_error=False,
+        )
+        assert result.is_error is True
+        assert "summary" in result.content[0].text.lower()
+
+    async def test_should_reject_shutdown_request_to_team_lead(self, client: Client):
+        await client.call_tool("team_create", {"team_name": "tv7"})
+        result = await client.call_tool(
+            "send_message",
+            {"team_name": "tv7", "type": "shutdown_request", "recipient": "team-lead"},
+            raise_on_error=False,
+        )
+        assert result.is_error is True
+        assert "team-lead" in result.content[0].text
+
+    async def test_should_reject_shutdown_request_to_nonexistent(self, client: Client):
+        await client.call_tool("team_create", {"team_name": "tv8"})
+        result = await client.call_tool(
+            "send_message",
+            {"team_name": "tv8", "type": "shutdown_request", "recipient": "ghost"},
+            raise_on_error=False,
+        )
+        assert result.is_error is True
+        assert "ghost" in result.content[0].text
+
+
+class TestProcessShutdownGuard:
+    async def test_should_reject_shutdown_of_team_lead(self, client: Client):
+        await client.call_tool("team_create", {"team_name": "tsg"})
+        result = await client.call_tool(
+            "process_shutdown_approved",
+            {"team_name": "tsg", "agent_name": "team-lead"},
+            raise_on_error=False,
+        )
+        assert result.is_error is True
+        assert "team-lead" in result.content[0].text
+
+
+class TestErrorWrapping:
+    async def test_read_config_wraps_file_not_found(self, client: Client):
+        result = await client.call_tool(
+            "read_config", {"team_name": "nonexistent"}, raise_on_error=False,
+        )
+        assert result.is_error is True
+        assert "not found" in result.content[0].text.lower()
+
+    async def test_task_get_wraps_file_not_found(self, client: Client):
+        await client.call_tool("team_create", {"team_name": "tew"})
+        result = await client.call_tool(
+            "task_get", {"team_name": "tew", "task_id": "999"}, raise_on_error=False,
+        )
+        assert result.is_error is True
+        assert "not found" in result.content[0].text.lower()
+
+    async def test_task_update_wraps_file_not_found(self, client: Client):
+        await client.call_tool("team_create", {"team_name": "tew2"})
+        result = await client.call_tool(
+            "task_update",
+            {"team_name": "tew2", "task_id": "999", "status": "completed"},
+            raise_on_error=False,
+        )
+        assert result.is_error is True
+        assert "not found" in result.content[0].text.lower()
+
+    async def test_task_create_wraps_nonexistent_team(self, client: Client):
+        result = await client.call_tool(
+            "task_create",
+            {"team_name": "ghost-team", "subject": "x", "description": "y"},
+            raise_on_error=False,
+        )
+        assert result.is_error is True
+        assert "does not exist" in result.content[0].text.lower()
+
+    async def test_task_update_wraps_validation_error(self, client: Client):
+        await client.call_tool("team_create", {"team_name": "tew3"})
+        created = _data(
+            await client.call_tool(
+                "task_create",
+                {"team_name": "tew3", "subject": "S", "description": "d"},
+            )
+        )
+        await client.call_tool(
+            "task_update",
+            {"team_name": "tew3", "task_id": created["id"], "status": "in_progress"},
+        )
+        result = await client.call_tool(
+            "task_update",
+            {"team_name": "tew3", "task_id": created["id"], "status": "pending"},
+            raise_on_error=False,
+        )
+        assert result.is_error is True
+        assert "cannot transition" in result.content[0].text.lower()
+
+
 class TestPollInbox:
     async def test_should_return_empty_on_timeout(self, client: Client):
         await client.call_tool("team_create", {"team_name": "t6"})

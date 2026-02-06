@@ -130,6 +130,32 @@ class TestWriteConfig:
         assert tmp_files == [], f"Leaked temp files: {tmp_files}"
 
 
+class TestTeamExists:
+    def test_should_return_true_for_existing_team(self, tmp_claude_dir: Path) -> None:
+        from claude_teams.teams import team_exists
+        create_team("exists", "sess-1", base_dir=tmp_claude_dir)
+        assert team_exists("exists", base_dir=tmp_claude_dir) is True
+
+    def test_should_return_false_for_nonexistent_team(self, tmp_claude_dir: Path) -> None:
+        from claude_teams.teams import team_exists
+        assert team_exists("ghost", base_dir=tmp_claude_dir) is False
+
+
+class TestRemoveMemberGuard:
+    def test_should_reject_removing_team_lead(self, tmp_claude_dir: Path) -> None:
+        create_team("guarded", "sess-1", base_dir=tmp_claude_dir)
+        with pytest.raises(ValueError, match="Cannot remove team-lead"):
+            remove_member("guarded", "team-lead", base_dir=tmp_claude_dir)
+
+    def test_should_allow_removing_non_lead_member(self, tmp_claude_dir: Path) -> None:
+        create_team("ok-rm", "sess-1", base_dir=tmp_claude_dir)
+        mate = _make_teammate("temp", "ok-rm")
+        add_member("ok-rm", mate, base_dir=tmp_claude_dir)
+        remove_member("ok-rm", "temp", base_dir=tmp_claude_dir)
+        cfg = read_config("ok-rm", base_dir=tmp_claude_dir)
+        assert len(cfg.members) == 1
+
+
 class TestReadConfig:
     def test_read_config_round_trip(self, tmp_claude_dir: Path) -> None:
         result = create_team("roundtrip", "sess-99", description="rt test", base_dir=tmp_claude_dir)

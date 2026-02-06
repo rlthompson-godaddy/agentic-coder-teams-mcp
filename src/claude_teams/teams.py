@@ -31,6 +31,11 @@ def _tasks_dir(base_dir: Path | None = None) -> Path:
     return (base_dir / "tasks") if base_dir else TASKS_DIR
 
 
+def team_exists(name: str, base_dir: Path | None = None) -> bool:
+    config_path = _teams_dir(base_dir) / name / "config.json"
+    return config_path.exists()
+
+
 def create_team(
     name: str,
     session_id: str,
@@ -134,6 +139,8 @@ def add_member(name: str, member: TeammateMember, base_dir: Path | None = None) 
 
 
 def remove_member(team_name: str, agent_name: str, base_dir: Path | None = None) -> None:
+    if agent_name == "team-lead":
+        raise ValueError("Cannot remove team-lead from team")
     config = read_config(team_name, base_dir=base_dir)
     config.members = [m for m in config.members if m.name != agent_name]
     write_config(team_name, config, base_dir=base_dir)

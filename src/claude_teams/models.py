@@ -80,7 +80,7 @@ class TaskFile(BaseModel):
     subject: str
     description: str
     active_form: str = Field(alias="activeForm", default="")
-    status: Literal["pending", "in_progress", "completed"] = "pending"
+    status: Literal["pending", "in_progress", "completed", "deleted"] = "pending"
     blocks: list[str] = Field(default_factory=list)
     blocked_by: list[str] = Field(alias="blockedBy", default_factory=list)
     owner: str | None = Field(default=None)

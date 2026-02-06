@@ -17,10 +17,9 @@ from claude_teams.tasks import (
 
 @pytest.fixture
 def team_tasks_dir(tmp_claude_dir):
-    d = tmp_claude_dir / "tasks" / "test-team"
-    d.mkdir(parents=True, exist_ok=True)
-    (d / ".lock").touch()
-    return d
+    from claude_teams.teams import create_team
+    create_team("test-team", "sess-test", base_dir=tmp_claude_dir)
+    return tmp_claude_dir / "tasks" / "test-team"
 
 
 def test_create_task_assigns_id_1_first(tmp_claude_dir, team_tasks_dir):
@@ -93,26 +92,32 @@ def test_update_task_delete_removes_file(tmp_claude_dir, team_tasks_dir):
 
 def test_update_task_add_blocks(tmp_claude_dir, team_tasks_dir):
     task = create_task("test-team", "Sub", "desc", base_dir=tmp_claude_dir)
+    t2 = create_task("test-team", "T2", "d", base_dir=tmp_claude_dir)
+    t3 = create_task("test-team", "T3", "d", base_dir=tmp_claude_dir)
+    t4 = create_task("test-team", "T4", "d", base_dir=tmp_claude_dir)
     updated = update_task(
-        "test-team", task.id, add_blocks=["2", "3"], base_dir=tmp_claude_dir
+        "test-team", task.id, add_blocks=[t2.id, t3.id], base_dir=tmp_claude_dir
     )
-    assert updated.blocks == ["2", "3"]
+    assert updated.blocks == [t2.id, t3.id]
     updated2 = update_task(
-        "test-team", task.id, add_blocks=["3", "4"], base_dir=tmp_claude_dir
+        "test-team", task.id, add_blocks=[t3.id, t4.id], base_dir=tmp_claude_dir
     )
-    assert updated2.blocks == ["2", "3", "4"]
+    assert updated2.blocks == [t2.id, t3.id, t4.id]
 
 
 def test_update_task_add_blocked_by(tmp_claude_dir, team_tasks_dir):
     task = create_task("test-team", "Sub", "desc", base_dir=tmp_claude_dir)
+    t2 = create_task("test-team", "Dep1", "d", base_dir=tmp_claude_dir)
+    t3 = create_task("test-team", "Dep2", "d", base_dir=tmp_claude_dir)
+    t4 = create_task("test-team", "Dep3", "d", base_dir=tmp_claude_dir)
     updated = update_task(
-        "test-team", task.id, add_blocked_by=["5", "6"], base_dir=tmp_claude_dir
+        "test-team", task.id, add_blocked_by=[t2.id, t3.id], base_dir=tmp_claude_dir
     )
-    assert updated.blocked_by == ["5", "6"]
+    assert updated.blocked_by == [t2.id, t3.id]
     updated2 = update_task(
-        "test-team", task.id, add_blocked_by=["6", "7"], base_dir=tmp_claude_dir
+        "test-team", task.id, add_blocked_by=[t3.id, t4.id], base_dir=tmp_claude_dir
     )
-    assert updated2.blocked_by == ["5", "6", "7"]
+    assert updated2.blocked_by == [t2.id, t3.id, t4.id]
 
 
 def test_update_task_metadata_merge(tmp_claude_dir, team_tasks_dir):
@@ -183,3 +188,109 @@ def test_reset_owner_tasks_only_affects_matching_owner(tmp_claude_dir, team_task
     assert after1.owner is None
     assert after2.status == "in_progress"
     assert after2.owner == "w2"
+
+
+def test_create_task_rejects_empty_subject(tmp_claude_dir, team_tasks_dir):
+    with pytest.raises(ValueError, match="subject must not be empty"):
+        create_task("test-team", "", "desc", base_dir=tmp_claude_dir)
+
+
+def test_create_task_rejects_whitespace_subject(tmp_claude_dir, team_tasks_dir):
+    with pytest.raises(ValueError, match="subject must not be empty"):
+        create_task("test-team", "   ", "desc", base_dir=tmp_claude_dir)
+
+
+def test_create_task_rejects_nonexistent_team(tmp_claude_dir):
+    with pytest.raises(ValueError, match="does not exist"):
+        create_task("no-such-team", "Sub", "desc", base_dir=tmp_claude_dir)
+
+
+def test_update_task_rejects_self_reference_in_blocks(tmp_claude_dir, team_tasks_dir):
+    task = create_task("test-team", "Sub", "desc", base_dir=tmp_claude_dir)
+    with pytest.raises(ValueError, match="cannot block itself"):
+        update_task("test-team", task.id, add_blocks=[task.id], base_dir=tmp_claude_dir)
+
+
+def test_update_task_rejects_self_reference_in_blocked_by(tmp_claude_dir, team_tasks_dir):
+    task = create_task("test-team", "Sub", "desc", base_dir=tmp_claude_dir)
+    with pytest.raises(ValueError, match="cannot be blocked by itself"):
+        update_task("test-team", task.id, add_blocked_by=[task.id], base_dir=tmp_claude_dir)
+
+
+def test_update_task_rejects_nonexistent_dep_in_blocks(tmp_claude_dir, team_tasks_dir):
+    task = create_task("test-team", "Sub", "desc", base_dir=tmp_claude_dir)
+    with pytest.raises(ValueError, match="does not exist"):
+        update_task("test-team", task.id, add_blocks=["999"], base_dir=tmp_claude_dir)
+
+
+def test_update_task_rejects_nonexistent_dep_in_blocked_by(tmp_claude_dir, team_tasks_dir):
+    task = create_task("test-team", "Sub", "desc", base_dir=tmp_claude_dir)
+    with pytest.raises(ValueError, match="does not exist"):
+        update_task("test-team", task.id, add_blocked_by=["999"], base_dir=tmp_claude_dir)
+
+
+def test_update_task_rejects_backward_status_transition(tmp_claude_dir, team_tasks_dir):
+    task = create_task("test-team", "Sub", "desc", base_dir=tmp_claude_dir)
+    update_task("test-team", task.id, status="in_progress", base_dir=tmp_claude_dir)
+    with pytest.raises(ValueError, match="Cannot transition"):
+        update_task("test-team", task.id, status="pending", base_dir=tmp_claude_dir)
+
+
+def test_update_task_rejects_completed_to_in_progress(tmp_claude_dir, team_tasks_dir):
+    task = create_task("test-team", "Sub", "desc", base_dir=tmp_claude_dir)
+    update_task("test-team", task.id, status="in_progress", base_dir=tmp_claude_dir)
+    update_task("test-team", task.id, status="completed", base_dir=tmp_claude_dir)
+    with pytest.raises(ValueError, match="Cannot transition"):
+        update_task("test-team", task.id, status="in_progress", base_dir=tmp_claude_dir)
+
+
+def test_update_task_allows_forward_status_transition(tmp_claude_dir, team_tasks_dir):
+    task = create_task("test-team", "Sub", "desc", base_dir=tmp_claude_dir)
+    updated = update_task("test-team", task.id, status="in_progress", base_dir=tmp_claude_dir)
+    assert updated.status == "in_progress"
+    updated2 = update_task("test-team", task.id, status="completed", base_dir=tmp_claude_dir)
+    assert updated2.status == "completed"
+
+
+def test_update_task_allows_pending_to_completed(tmp_claude_dir, team_tasks_dir):
+    task = create_task("test-team", "Sub", "desc", base_dir=tmp_claude_dir)
+    updated = update_task("test-team", task.id, status="completed", base_dir=tmp_claude_dir)
+    assert updated.status == "completed"
+
+
+def test_update_task_rejects_start_when_blocked(tmp_claude_dir, team_tasks_dir):
+    blocker = create_task("test-team", "Blocker", "b", base_dir=tmp_claude_dir)
+    task = create_task("test-team", "Blocked", "d", base_dir=tmp_claude_dir)
+    update_task("test-team", task.id, add_blocked_by=[blocker.id], base_dir=tmp_claude_dir)
+    with pytest.raises(ValueError, match="blocked by task"):
+        update_task("test-team", task.id, status="in_progress", base_dir=tmp_claude_dir)
+
+
+def test_update_task_allows_start_when_blockers_completed(tmp_claude_dir, team_tasks_dir):
+    blocker = create_task("test-team", "Blocker", "b", base_dir=tmp_claude_dir)
+    task = create_task("test-team", "Blocked", "d", base_dir=tmp_claude_dir)
+    update_task("test-team", task.id, add_blocked_by=[blocker.id], base_dir=tmp_claude_dir)
+    update_task("test-team", blocker.id, status="in_progress", base_dir=tmp_claude_dir)
+    update_task("test-team", blocker.id, status="completed", base_dir=tmp_claude_dir)
+    updated = update_task("test-team", task.id, status="in_progress", base_dir=tmp_claude_dir)
+    assert updated.status == "in_progress"
+
+
+def test_update_task_allows_start_when_blocker_deleted(tmp_claude_dir, team_tasks_dir):
+    blocker = create_task("test-team", "Blocker", "b", base_dir=tmp_claude_dir)
+    task = create_task("test-team", "Blocked", "d", base_dir=tmp_claude_dir)
+    update_task("test-team", task.id, add_blocked_by=[blocker.id], base_dir=tmp_claude_dir)
+    update_task("test-team", blocker.id, status="deleted", base_dir=tmp_claude_dir)
+    updated = update_task("test-team", task.id, status="in_progress", base_dir=tmp_claude_dir)
+    assert updated.status == "in_progress"
+
+
+def test_delete_task_cleans_up_stale_refs(tmp_claude_dir, team_tasks_dir):
+    t1 = create_task("test-team", "A", "d1", base_dir=tmp_claude_dir)
+    t2 = create_task("test-team", "B", "d2", base_dir=tmp_claude_dir)
+    update_task("test-team", t2.id, add_blocked_by=[t1.id], base_dir=tmp_claude_dir)
+    update_task("test-team", t1.id, add_blocks=[t2.id], base_dir=tmp_claude_dir)
+    update_task("test-team", t1.id, status="deleted", base_dir=tmp_claude_dir)
+    t2_after = get_task("test-team", t2.id, base_dir=tmp_claude_dir)
+    assert t1.id not in t2_after.blocked_by
+    assert t1.id not in t2_after.blocks

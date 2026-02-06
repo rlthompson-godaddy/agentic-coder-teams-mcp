@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from claude_teams.models import TaskFile
+from claude_teams.teams import team_exists
 
 TASKS_DIR = Path.home() / ".claude" / "tasks"
 
@@ -24,6 +25,9 @@ def file_lock(lock_path: Path):
 
 def _tasks_dir(base_dir: Path | None = None) -> Path:
     return (base_dir / "tasks") if base_dir else TASKS_DIR
+
+
+_STATUS_ORDER = {"pending": 0, "in_progress": 1, "completed": 2}
 
 
 def next_task_id(team_name: str, base_dir: Path | None = None) -> str:
@@ -45,6 +49,10 @@ def create_task(
     metadata: dict | None = None,
     base_dir: Path | None = None,
 ) -> TaskFile:
+    if not subject or not subject.strip():
+        raise ValueError("Task subject must not be empty")
+    if not team_exists(team_name, base_dir):
+        raise ValueError(f"Team {team_name!r} does not exist")
     team_dir = _tasks_dir(base_dir) / team_name
     team_dir.mkdir(parents=True, exist_ok=True)
     lock_path = team_dir / ".lock"
@@ -103,10 +111,13 @@ def update_task(
             task.active_form = active_form
         if owner is not None:
             task.owner = owner
-        if status is not None and status != "deleted":
-            task.status = status
 
         if add_blocks:
+            for b in add_blocks:
+                if b == task_id:
+                    raise ValueError(f"Task {task_id} cannot block itself")
+                if not (team_dir / f"{b}.json").exists():
+                    raise ValueError(f"Referenced task {b!r} does not exist")
             existing = set(task.blocks)
             for b in add_blocks:
                 if b not in existing:
@@ -114,6 +125,11 @@ def update_task(
                     existing.add(b)
 
         if add_blocked_by:
+            for b in add_blocked_by:
+                if b == task_id:
+                    raise ValueError(f"Task {task_id} cannot be blocked by itself")
+                if not (team_dir / f"{b}.json").exists():
+                    raise ValueError(f"Referenced task {b!r} does not exist")
             existing = set(task.blocked_by)
             for b in add_blocked_by:
                 if b not in existing:
@@ -129,9 +145,47 @@ def update_task(
                     current[k] = v
             task.metadata = current if current else None
 
+        if status is not None and status != "deleted":
+            cur_order = _STATUS_ORDER[task.status]
+            new_order = _STATUS_ORDER.get(status)
+            if new_order is None:
+                raise ValueError(f"Invalid status: {status!r}")
+            if new_order < cur_order:
+                raise ValueError(
+                    f"Cannot transition from {task.status!r} to {status!r}"
+                )
+            if status in ("in_progress", "completed") and task.blocked_by:
+                for blocker_id in task.blocked_by:
+                    blocker_path = team_dir / f"{blocker_id}.json"
+                    if blocker_path.exists():
+                        blocker = TaskFile(**json.loads(blocker_path.read_text()))
+                        if blocker.status != "completed":
+                            raise ValueError(
+                                f"Cannot set status to {status!r}: "
+                                f"blocked by task {blocker_id} (status: {blocker.status!r})"
+                            )
+            task.status = status
+
         if status == "deleted":
             task.status = "deleted"
             fpath.unlink()
+            for f in team_dir.glob("*.json"):
+                try:
+                    int(f.stem)
+                except ValueError:
+                    continue
+                other = TaskFile(**json.loads(f.read_text()))
+                changed = False
+                if task_id in other.blocked_by:
+                    other.blocked_by.remove(task_id)
+                    changed = True
+                if task_id in other.blocks:
+                    other.blocks.remove(task_id)
+                    changed = True
+                if changed:
+                    f.write_text(
+                        json.dumps(other.model_dump(by_alias=True, exclude_none=True))
+                    )
             return task
 
         fpath.write_text(

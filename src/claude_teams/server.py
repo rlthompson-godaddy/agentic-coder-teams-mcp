@@ -58,10 +58,11 @@ def team_create(
 
 
 @mcp.tool
-def team_delete(team_name: str) -> dict:
+def team_delete(team_name: str, ctx: Context) -> dict:
     """Delete a team and all its data. Fails if any teammates are still active.
     Removes both team config and task directories."""
     result = teams.delete_team(team_name)
+    _get_lifespan(ctx)["active_team"] = None
     return result.model_dump()
 
 
@@ -115,14 +116,23 @@ def send_message(
     Type 'plan_approval_response' responds to a plan approval request (requires recipient, request_id, approve)."""
 
     if type == "message":
+        if not content:
+            raise ToolError("Message content must not be empty")
+        if not summary:
+            raise ToolError("Message summary must not be empty")
+        if not recipient:
+            raise ToolError("Message recipient must not be empty")
         config = teams.read_config(team_name)
+        member_names = {m.name for m in config.members}
+        if recipient not in member_names:
+            raise ToolError(f"Recipient {recipient!r} is not a member of team {team_name!r}")
         target_color = None
         for m in config.members:
             if m.name == recipient and isinstance(m, TeammateMember):
                 target_color = m.color
                 break
         messaging.send_plain_message(
-            team_name, "team-lead", recipient, content, summary=summary, color=None,
+            team_name, "team-lead", recipient, content, summary=summary, color=target_color,
         )
         return SendMessageResult(
             success=True,
@@ -137,6 +147,8 @@ def send_message(
         ).model_dump(exclude_none=True)
 
     elif type == "broadcast":
+        if not summary:
+            raise ToolError("Broadcast summary must not be empty")
         config = teams.read_config(team_name)
         count = 0
         for m in config.members:
@@ -151,6 +163,14 @@ def send_message(
         ).model_dump(exclude_none=True)
 
     elif type == "shutdown_request":
+        if not recipient:
+            raise ToolError("Shutdown request recipient must not be empty")
+        if recipient == "team-lead":
+            raise ToolError("Cannot send shutdown request to team-lead")
+        config = teams.read_config(team_name)
+        member_names = {m.name for m in config.members}
+        if recipient not in member_names:
+            raise ToolError(f"Recipient {recipient!r} is not a member of team {team_name!r}")
         req_id = messaging.send_shutdown_request(team_name, recipient, reason=content)
         return SendMessageResult(
             success=True,
@@ -223,7 +243,10 @@ def task_create(
 ) -> dict:
     """Create a new task for the team. Tasks are auto-assigned incrementing IDs.
     Optional metadata dict is stored alongside the task."""
-    task = tasks.create_task(team_name, subject, description, active_form, metadata)
+    try:
+        task = tasks.create_task(team_name, subject, description, active_form, metadata)
+    except ValueError as e:
+        raise ToolError(str(e))
     return task.model_dump(by_alias=True, exclude_none=True)
 
 
@@ -243,12 +266,17 @@ def task_update(
     """Update a task's fields. Setting owner auto-notifies the assignee via
     inbox. Setting status to 'deleted' removes the task file from disk.
     Metadata keys are merged into existing metadata (set a key to null to delete it)."""
-    task = tasks.update_task(
-        team_name, task_id,
-        status=status, owner=owner, subject=subject, description=description,
-        active_form=active_form, add_blocks=add_blocks, add_blocked_by=add_blocked_by,
-        metadata=metadata,
-    )
+    try:
+        task = tasks.update_task(
+            team_name, task_id,
+            status=status, owner=owner, subject=subject, description=description,
+            active_form=active_form, add_blocks=add_blocks, add_blocked_by=add_blocked_by,
+            metadata=metadata,
+        )
+    except FileNotFoundError:
+        raise ToolError(f"Task {task_id!r} not found in team {team_name!r}")
+    except ValueError as e:
+        raise ToolError(str(e))
     if owner is not None and task.owner is not None and task.status != "deleted":
         messaging.send_task_assignment(team_name, task, assigned_by="team-lead")
     return task.model_dump(by_alias=True, exclude_none=True)
@@ -264,7 +292,10 @@ def task_list(team_name: str) -> list[dict]:
 @mcp.tool
 def task_get(team_name: str, task_id: str) -> dict:
     """Get full details of a specific task by ID."""
-    task = tasks.get_task(team_name, task_id)
+    try:
+        task = tasks.get_task(team_name, task_id)
+    except FileNotFoundError:
+        raise ToolError(f"Task {task_id!r} not found in team {team_name!r}")
     return task.model_dump(by_alias=True, exclude_none=True)
 
 
@@ -284,7 +315,10 @@ def read_inbox(
 @mcp.tool
 def read_config(team_name: str) -> dict:
     """Read the current team configuration including all members."""
-    config = teams.read_config(team_name)
+    try:
+        config = teams.read_config(team_name)
+    except FileNotFoundError:
+        raise ToolError(f"Team {team_name!r} not found")
     return config.model_dump(by_alias=True)
 
 
@@ -330,6 +364,8 @@ async def poll_inbox(
 def process_shutdown_approved(team_name: str, agent_name: str) -> dict:
     """Process a teammate's shutdown by removing them from config and resetting
     their tasks. Call this after confirming shutdown_approved in the lead inbox."""
+    if agent_name == "team-lead":
+        raise ToolError("Cannot process shutdown for team-lead")
     teams.remove_member(team_name, agent_name)
     tasks.reset_owner_tasks(team_name, agent_name)
     return {"success": True, "message": f"{agent_name} removed from team."}
