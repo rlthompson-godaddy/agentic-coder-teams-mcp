@@ -1,13 +1,16 @@
-from __future__ import annotations
-
 import json
 import time
 from pathlib import Path
+from typing import cast
+from unittest.mock import MagicMock
 
 import pytest
 from fastmcp import Client
+from mcp.types import TextContent
 
 from claude_teams import messaging, tasks, teams
+from claude_teams.backends import registry as _registry
+from claude_teams.backends.base import HealthStatus, SpawnResult as BackendSpawnResult
 from claude_teams.models import TeammateMember
 from claude_teams.server import mcp
 
@@ -27,25 +30,65 @@ def _make_teammate(name: str, team_name: str, pane_id: str = "%1") -> TeammateMe
     )
 
 
+def _make_mock_backend(name: str = "claude-code") -> MagicMock:
+    """Create a mock backend that satisfies the Backend protocol."""
+    mock = MagicMock()
+    mock.name = name
+    mock.binary_name = "claude"
+    mock.is_available.return_value = True
+    mock.discover_binary.return_value = "/usr/bin/echo"
+    mock.supported_models.return_value = ["haiku", "sonnet", "opus"]
+    mock.default_model.return_value = "sonnet"
+    mock.resolve_model.side_effect = lambda m: {
+        "fast": "haiku",
+        "balanced": "sonnet",
+        "powerful": "opus",
+        "haiku": "haiku",
+        "sonnet": "sonnet",
+        "opus": "opus",
+    }.get(m, m)
+    mock.spawn.return_value = BackendSpawnResult(
+        process_handle="%mock",
+        backend_type=name,
+    )
+    mock.health_check.return_value = HealthStatus(alive=True, detail="mock check")
+    mock.kill.return_value = None
+    return mock
+
+
 @pytest.fixture
 async def client(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(teams, "TEAMS_DIR", tmp_path / "teams")
     monkeypatch.setattr(teams, "TASKS_DIR", tmp_path / "tasks")
     monkeypatch.setattr(tasks, "TASKS_DIR", tmp_path / "tasks")
     monkeypatch.setattr(messaging, "TEAMS_DIR", tmp_path / "teams")
-    monkeypatch.setattr(
-        "claude_teams.server.discover_claude_binary", lambda: "/usr/bin/echo"
-    )
+
+    # Register a mock claude-code backend in the registry
+    mock_backend = _make_mock_backend("claude-code")
+    _registry._loaded = True
+    _registry._backends = {"claude-code": mock_backend}
+
     (tmp_path / "teams").mkdir()
     (tmp_path / "tasks").mkdir()
     async with Client(mcp) as c:
         yield c
 
+    # Cleanup: reset registry state
+    _registry._loaded = False
+    _registry._backends = {}
+
+
+def _text(result) -> str:
+    """Extract text from the first content item of a tool result."""
+    item = result.content[0]
+    assert isinstance(item, TextContent)
+    return item.text
+
 
 def _data(result):
     """Extract raw Python data from a successful CallToolResult."""
     if result.content:
-        return json.loads(result.content[0].text)
+        return json.loads(_text(result))
     return result.data
 
 
@@ -56,7 +99,7 @@ class TestErrorPropagation:
             "team_create", {"team_name": "beta"}, raise_on_error=False
         )
         assert result.is_error is True
-        assert "alpha" in result.content[0].text
+        assert "alpha" in _text(result)
 
     async def test_should_reject_unknown_agent_in_force_kill(self, client: Client):
         await client.call_tool("team_create", {"team_name": "t1"})
@@ -66,7 +109,7 @@ class TestErrorPropagation:
             raise_on_error=False,
         )
         assert result.is_error is True
-        assert "ghost" in result.content[0].text
+        assert "ghost" in _text(result)
 
     async def test_should_reject_invalid_message_type(self, client: Client):
         await client.call_tool("team_create", {"team_name": "t_msg"})
@@ -103,7 +146,9 @@ class TestDeletedTaskGuard:
         )
         assert inbox == []
 
-    async def test_should_send_assignment_when_owner_set_on_live_task(self, client: Client):
+    async def test_should_send_assignment_when_owner_set_on_live_task(
+        self, client: Client
+    ):
         await client.call_tool("team_create", {"team_name": "t2b"})
         created = _data(
             await client.call_tool(
@@ -127,7 +172,9 @@ class TestDeletedTaskGuard:
 
 
 class TestShutdownResponseSender:
-    async def test_should_populate_correct_from_and_pane_id_on_approve(self, client: Client):
+    async def test_should_populate_correct_from_and_pane_id_on_approve(
+        self, client: Client
+    ):
         await client.call_tool("team_create", {"team_name": "t3"})
         teams.add_member("t3", _make_teammate("worker", "t3", pane_id="%42"))
         await client.call_tool(
@@ -280,49 +327,79 @@ class TestSendMessageValidation:
         teams.add_member("tv1", _make_teammate("bob", "tv1"))
         result = await client.call_tool(
             "send_message",
-            {"team_name": "tv1", "type": "message", "recipient": "bob", "content": "", "summary": "hi"},
+            {
+                "team_name": "tv1",
+                "type": "message",
+                "recipient": "bob",
+                "content": "",
+                "summary": "hi",
+            },
             raise_on_error=False,
         )
         assert result.is_error is True
-        assert "content" in result.content[0].text.lower()
+        assert "content" in _text(result).lower()
 
     async def test_should_reject_empty_summary(self, client: Client):
         await client.call_tool("team_create", {"team_name": "tv2"})
         teams.add_member("tv2", _make_teammate("bob", "tv2"))
         result = await client.call_tool(
             "send_message",
-            {"team_name": "tv2", "type": "message", "recipient": "bob", "content": "hi", "summary": ""},
+            {
+                "team_name": "tv2",
+                "type": "message",
+                "recipient": "bob",
+                "content": "hi",
+                "summary": "",
+            },
             raise_on_error=False,
         )
         assert result.is_error is True
-        assert "summary" in result.content[0].text.lower()
+        assert "summary" in _text(result).lower()
 
     async def test_should_reject_empty_recipient(self, client: Client):
         await client.call_tool("team_create", {"team_name": "tv3"})
         result = await client.call_tool(
             "send_message",
-            {"team_name": "tv3", "type": "message", "recipient": "", "content": "hi", "summary": "hi"},
+            {
+                "team_name": "tv3",
+                "type": "message",
+                "recipient": "",
+                "content": "hi",
+                "summary": "hi",
+            },
             raise_on_error=False,
         )
         assert result.is_error is True
-        assert "recipient" in result.content[0].text.lower()
+        assert "recipient" in _text(result).lower()
 
     async def test_should_reject_nonexistent_recipient(self, client: Client):
         await client.call_tool("team_create", {"team_name": "tv4"})
         result = await client.call_tool(
             "send_message",
-            {"team_name": "tv4", "type": "message", "recipient": "ghost", "content": "hi", "summary": "hi"},
+            {
+                "team_name": "tv4",
+                "type": "message",
+                "recipient": "ghost",
+                "content": "hi",
+                "summary": "hi",
+            },
             raise_on_error=False,
         )
         assert result.is_error is True
-        assert "ghost" in result.content[0].text
+        assert "ghost" in _text(result)
 
     async def test_should_pass_target_color(self, client: Client):
         await client.call_tool("team_create", {"team_name": "tv5"})
         teams.add_member("tv5", _make_teammate("bob", "tv5"))
         result = await client.call_tool(
             "send_message",
-            {"team_name": "tv5", "type": "message", "recipient": "bob", "content": "hey", "summary": "greet"},
+            {
+                "team_name": "tv5",
+                "type": "message",
+                "recipient": "bob",
+                "content": "hey",
+                "summary": "greet",
+            },
         )
         data = _data(result)
         assert data["routing"]["targetColor"] == "blue"
@@ -331,11 +408,16 @@ class TestSendMessageValidation:
         await client.call_tool("team_create", {"team_name": "tv6"})
         result = await client.call_tool(
             "send_message",
-            {"team_name": "tv6", "type": "broadcast", "content": "hello", "summary": ""},
+            {
+                "team_name": "tv6",
+                "type": "broadcast",
+                "content": "hello",
+                "summary": "",
+            },
             raise_on_error=False,
         )
         assert result.is_error is True
-        assert "summary" in result.content[0].text.lower()
+        assert "summary" in _text(result).lower()
 
     async def test_should_reject_shutdown_request_to_team_lead(self, client: Client):
         await client.call_tool("team_create", {"team_name": "tv7"})
@@ -345,7 +427,7 @@ class TestSendMessageValidation:
             raise_on_error=False,
         )
         assert result.is_error is True
-        assert "team-lead" in result.content[0].text
+        assert "team-lead" in _text(result)
 
     async def test_should_reject_shutdown_request_to_nonexistent(self, client: Client):
         await client.call_tool("team_create", {"team_name": "tv8"})
@@ -355,7 +437,7 @@ class TestSendMessageValidation:
             raise_on_error=False,
         )
         assert result.is_error is True
-        assert "ghost" in result.content[0].text
+        assert "ghost" in _text(result)
 
 
 class TestProcessShutdownGuard:
@@ -367,24 +449,28 @@ class TestProcessShutdownGuard:
             raise_on_error=False,
         )
         assert result.is_error is True
-        assert "team-lead" in result.content[0].text
+        assert "team-lead" in _text(result)
 
 
 class TestErrorWrapping:
     async def test_read_config_wraps_file_not_found(self, client: Client):
         result = await client.call_tool(
-            "read_config", {"team_name": "nonexistent"}, raise_on_error=False,
+            "read_config",
+            {"team_name": "nonexistent"},
+            raise_on_error=False,
         )
         assert result.is_error is True
-        assert "not found" in result.content[0].text.lower()
+        assert "not found" in _text(result).lower()
 
     async def test_task_get_wraps_file_not_found(self, client: Client):
         await client.call_tool("team_create", {"team_name": "tew"})
         result = await client.call_tool(
-            "task_get", {"team_name": "tew", "task_id": "999"}, raise_on_error=False,
+            "task_get",
+            {"team_name": "tew", "task_id": "999"},
+            raise_on_error=False,
         )
         assert result.is_error is True
-        assert "not found" in result.content[0].text.lower()
+        assert "not found" in _text(result).lower()
 
     async def test_task_update_wraps_file_not_found(self, client: Client):
         await client.call_tool("team_create", {"team_name": "tew2"})
@@ -394,7 +480,7 @@ class TestErrorWrapping:
             raise_on_error=False,
         )
         assert result.is_error is True
-        assert "not found" in result.content[0].text.lower()
+        assert "not found" in _text(result).lower()
 
     async def test_task_create_wraps_nonexistent_team(self, client: Client):
         result = await client.call_tool(
@@ -403,7 +489,7 @@ class TestErrorWrapping:
             raise_on_error=False,
         )
         assert result.is_error is True
-        assert "does not exist" in result.content[0].text.lower()
+        assert "does not exist" in _text(result).lower()
 
     async def test_task_update_wraps_validation_error(self, client: Client):
         await client.call_tool("team_create", {"team_name": "tew3"})
@@ -423,14 +509,16 @@ class TestErrorWrapping:
             raise_on_error=False,
         )
         assert result.is_error is True
-        assert "cannot transition" in result.content[0].text.lower()
+        assert "cannot transition" in _text(result).lower()
 
     async def test_task_list_wraps_nonexistent_team(self, client: Client):
         result = await client.call_tool(
-            "task_list", {"team_name": "ghost-team"}, raise_on_error=False,
+            "task_list",
+            {"team_name": "ghost-team"},
+            raise_on_error=False,
         )
         assert result.is_error is True
-        assert "does not exist" in result.content[0].text.lower()
+        assert "does not exist" in _text(result).lower()
 
 
 class TestPollInbox:
@@ -466,7 +554,9 @@ class TestPollInbox:
         assert len(result) == 1
         assert result[0]["text"] == "wake up"
 
-    async def test_should_return_existing_messages_with_zero_timeout(self, client: Client):
+    async def test_should_return_existing_messages_with_zero_timeout(
+        self, client: Client
+    ):
         await client.call_tool("team_create", {"team_name": "t6c"})
         teams.add_member("t6c", _make_teammate("bob", "t6c"))
         await client.call_tool(
@@ -494,21 +584,27 @@ class TestTeamDeleteErrorWrapping:
         await client.call_tool("team_create", {"team_name": "td1"})
         teams.add_member("td1", _make_teammate("worker", "td1"))
         result = await client.call_tool(
-            "team_delete", {"team_name": "td1"}, raise_on_error=False,
+            "team_delete",
+            {"team_name": "td1"},
+            raise_on_error=False,
         )
         assert result.is_error is True
-        assert "member" in result.content[0].text.lower()
+        assert "member" in _text(result).lower()
 
     async def test_should_reject_delete_nonexistent_team(self, client: Client):
         result = await client.call_tool(
-            "team_delete", {"team_name": "ghost-team"}, raise_on_error=False,
+            "team_delete",
+            {"team_name": "ghost-team"},
+            raise_on_error=False,
         )
         assert result.is_error is True
-        assert "Traceback" not in result.content[0].text
+        assert "Traceback" not in _text(result)
 
 
 class TestPlanApprovalValidation:
-    async def test_should_reject_plan_approval_to_nonexistent_recipient(self, client: Client):
+    async def test_should_reject_plan_approval_to_nonexistent_recipient(
+        self, client: Client
+    ):
         await client.call_tool("team_create", {"team_name": "tp1"})
         result = await client.call_tool(
             "send_message",
@@ -521,9 +617,11 @@ class TestPlanApprovalValidation:
             raise_on_error=False,
         )
         assert result.is_error is True
-        assert "ghost" in result.content[0].text
+        assert "ghost" in _text(result)
 
-    async def test_should_reject_plan_approval_with_empty_recipient(self, client: Client):
+    async def test_should_reject_plan_approval_with_empty_recipient(
+        self, client: Client
+    ):
         await client.call_tool("team_create", {"team_name": "tp2"})
         result = await client.call_tool(
             "send_message",
@@ -536,4 +634,247 @@ class TestPlanApprovalValidation:
             raise_on_error=False,
         )
         assert result.is_error is True
-        assert "recipient" in result.content[0].text.lower()
+        assert "recipient" in _text(result).lower()
+
+
+# ---------------------------------------------------------------------------
+# New backend-aware tools
+# ---------------------------------------------------------------------------
+
+
+class TestListBackends:
+    async def test_returns_registered_backends(self, client: Client):
+        result = _data(await client.call_tool("list_backends", {}))
+        assert isinstance(result, list)
+        assert len(result) >= 1
+        backend_info = result[0]
+        assert "name" in backend_info
+        assert "binary" in backend_info
+        assert "available" in backend_info
+        assert "defaultModel" in backend_info
+        assert "supportedModels" in backend_info
+
+    async def test_returns_correct_backend_name(self, client: Client):
+        result = _data(await client.call_tool("list_backends", {}))
+        names = [backend["name"] for backend in result]
+        assert "claude-code" in names
+
+    async def test_returns_empty_when_no_backends(self, client: Client):
+        # Clear all backends from registry
+        _registry._backends = {}
+        result = _data(await client.call_tool("list_backends", {}))
+        assert result == []
+        # Restore for subsequent tests
+        _registry._backends = {"claude-code": _make_mock_backend("claude-code")}
+
+
+class TestHealthCheck:
+    async def test_returns_alive_for_running_teammate(self, client: Client):
+        await client.call_tool("team_create", {"team_name": "hc1"})
+        teams.add_member("hc1", _make_teammate("worker", "hc1", pane_id="%55"))
+
+        result = _data(
+            await client.call_tool(
+                "health_check", {"team_name": "hc1", "agent_name": "worker"}
+            )
+        )
+
+        assert result["alive"] is True
+        assert result["agent_name"] == "worker"
+        assert "backend" in result
+        assert "detail" in result
+
+    async def test_returns_dead_when_backend_says_dead(self, client: Client):
+        await client.call_tool("team_create", {"team_name": "hc2"})
+        teams.add_member("hc2", _make_teammate("deadworker", "hc2", pane_id="%56"))
+
+        # Override mock to return dead
+        mock_backend = cast(MagicMock, _registry._backends["claude-code"])
+        mock_backend.health_check.return_value = HealthStatus(
+            alive=False, detail="pane gone"
+        )
+
+        result = _data(
+            await client.call_tool(
+                "health_check", {"team_name": "hc2", "agent_name": "deadworker"}
+            )
+        )
+
+        assert result["alive"] is False
+        # Restore original behavior
+        mock_backend.health_check.return_value = HealthStatus(
+            alive=True, detail="mock check"
+        )
+
+    async def test_rejects_nonexistent_teammate(self, client: Client):
+        await client.call_tool("team_create", {"team_name": "hc3"})
+        result = await client.call_tool(
+            "health_check",
+            {"team_name": "hc3", "agent_name": "ghost"},
+            raise_on_error=False,
+        )
+        assert result.is_error is True
+        assert "ghost" in _text(result)
+
+    async def test_rejects_nonexistent_team(self, client: Client):
+        result = await client.call_tool(
+            "health_check",
+            {"team_name": "no-such-team", "agent_name": "worker"},
+            raise_on_error=False,
+        )
+        assert result.is_error is True
+        assert "not found" in _text(result).lower()
+
+
+class TestSpawnWithBackend:
+    async def test_spawns_with_explicit_backend(self, client: Client):
+        await client.call_tool("team_create", {"team_name": "sb1"})
+        result = _data(
+            await client.call_tool(
+                "spawn_teammate",
+                {
+                    "team_name": "sb1",
+                    "name": "coder",
+                    "prompt": "write code",
+                    "backend": "claude-code",
+                },
+            )
+        )
+        assert result["name"] == "coder"
+        assert result["team_name"] == "sb1"
+
+    async def test_spawns_with_default_backend(self, client: Client):
+        await client.call_tool("team_create", {"team_name": "sb2"})
+        result = _data(
+            await client.call_tool(
+                "spawn_teammate",
+                {
+                    "team_name": "sb2",
+                    "name": "coder",
+                    "prompt": "write code",
+                },
+            )
+        )
+        assert result["name"] == "coder"
+
+    async def test_rejects_invalid_backend(self, client: Client):
+        await client.call_tool("team_create", {"team_name": "sb3"})
+        result = await client.call_tool(
+            "spawn_teammate",
+            {
+                "team_name": "sb3",
+                "name": "coder",
+                "prompt": "write code",
+                "backend": "nonexistent-backend",
+            },
+            raise_on_error=False,
+        )
+        assert result.is_error is True
+        assert "nonexistent-backend" in _text(result)
+
+    async def test_resolves_generic_model_name(self, client: Client):
+        await client.call_tool("team_create", {"team_name": "sb4"})
+
+        mock_backend = cast(MagicMock, _registry._backends["claude-code"])
+        mock_backend.resolve_model.reset_mock()
+
+        await client.call_tool(
+            "spawn_teammate",
+            {
+                "team_name": "sb4",
+                "name": "coder",
+                "prompt": "write code",
+                "model": "fast",
+            },
+        )
+        mock_backend.resolve_model.assert_called_with("fast")
+
+    async def test_rejects_invalid_model_for_backend(self, client: Client):
+        await client.call_tool("team_create", {"team_name": "sb5"})
+
+        mock_backend = cast(MagicMock, _registry._backends["claude-code"])
+        original_side_effect = mock_backend.resolve_model.side_effect
+        mock_backend.resolve_model.side_effect = ValueError("Unsupported model 'bogus'")
+
+        result = await client.call_tool(
+            "spawn_teammate",
+            {
+                "team_name": "sb5",
+                "name": "coder",
+                "prompt": "write code",
+                "model": "bogus",
+            },
+            raise_on_error=False,
+        )
+        assert result.is_error is True
+        assert "bogus" in _text(result)
+
+        mock_backend.resolve_model.side_effect = original_side_effect
+
+
+class TestForceKillWithBackend:
+    async def test_kills_via_correct_backend(self, client: Client):
+        await client.call_tool("team_create", {"team_name": "fk1"})
+        mate = _make_teammate("victim", "fk1", pane_id="%77")
+        mate.backend_type = "claude-code"
+        mate.process_handle = "%77"
+        teams.add_member("fk1", mate)
+
+        mock_backend = cast(MagicMock, _registry._backends["claude-code"])
+        mock_backend.kill.reset_mock()
+
+        result = _data(
+            await client.call_tool(
+                "force_kill_teammate",
+                {"team_name": "fk1", "agent_name": "victim"},
+            )
+        )
+
+        assert result["success"] is True
+        mock_backend.kill.assert_called_once_with("%77")
+
+    async def test_legacy_tmux_backend_type_maps_to_claude_code(self, client: Client):
+        await client.call_tool("team_create", {"team_name": "fk2"})
+        mate = _make_teammate("oldmate", "fk2", pane_id="%88")
+        mate.backend_type = "tmux"
+        mate.process_handle = "%88"
+        teams.add_member("fk2", mate)
+
+        mock_backend = cast(MagicMock, _registry._backends["claude-code"])
+        mock_backend.kill.reset_mock()
+
+        result = _data(
+            await client.call_tool(
+                "force_kill_teammate",
+                {"team_name": "fk2", "agent_name": "oldmate"},
+            )
+        )
+
+        assert result["success"] is True
+        mock_backend.kill.assert_called_once_with("%88")
+
+    async def test_rejects_nonexistent_teammate(self, client: Client):
+        await client.call_tool("team_create", {"team_name": "fk3"})
+        result = await client.call_tool(
+            "force_kill_teammate",
+            {"team_name": "fk3", "agent_name": "ghost"},
+            raise_on_error=False,
+        )
+        assert result.is_error is True
+        assert "ghost" in _text(result)
+
+    async def test_skips_kill_when_backend_unavailable(self, client: Client):
+        await client.call_tool("team_create", {"team_name": "fk4"})
+        mate = _make_teammate("orphan", "fk4", pane_id="%99")
+        mate.backend_type = "nonexistent"
+        mate.process_handle = "%99"
+        teams.add_member("fk4", mate)
+
+        # Should not raise even if backend is unavailable
+        result = _data(
+            await client.call_tool(
+                "force_kill_teammate",
+                {"team_name": "fk4", "agent_name": "orphan"},
+            )
+        )
+        assert result["success"] is True

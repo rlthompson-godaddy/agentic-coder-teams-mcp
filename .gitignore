@@ -14,3 +14,5 @@ venv/
 *.so
 .DS_Store
 .mcp.json
+.omc
+docs/

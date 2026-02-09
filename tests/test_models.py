@@ -1,8 +1,5 @@
-from __future__ import annotations
-
 import json
 
-import pytest
 
 from claude_teams.models import (
     COLOR_PALETTE,
@@ -30,7 +27,16 @@ class TestColorPalette:
         assert COLOR_PALETTE[0] == "blue"
 
     def test_all_expected_colors_present(self):
-        expected = {"blue", "green", "yellow", "purple", "orange", "pink", "cyan", "red"}
+        expected = {
+            "blue",
+            "green",
+            "yellow",
+            "purple",
+            "orange",
+            "pink",
+            "cyan",
+            "red",
+        }
         assert set(COLOR_PALETTE) == expected
 
 
@@ -115,7 +121,7 @@ class TestTeammateMember:
             cwd="/tmp",
         )
         assert mate.plan_mode_required is False
-        assert mate.backend_type == "tmux"
+        assert mate.backend_type == "claude-code"
         assert mate.is_active is False
         assert mate.subscriptions == []
 
@@ -243,49 +249,49 @@ class TestInboxMessage:
 
 class TestStructuredMessages:
     def test_idle_notification(self):
-        n = IdleNotification(
+        notification = IdleNotification(
             from_="worker",
             timestamp="2026-02-06T17:18:04.701Z",
         )
-        data = json.loads(n.model_dump_json(by_alias=True))
+        data = json.loads(notification.model_dump_json(by_alias=True))
         assert data["type"] == "idle_notification"
         assert data["from"] == "worker"
         assert data["idleReason"] == "available"
 
     def test_task_assignment(self):
-        a = TaskAssignment(
+        assignment = TaskAssignment(
             task_id="1",
             subject="Do thing",
             description="Details",
             assigned_by="team-lead",
             timestamp="2026-02-06T17:18:04.701Z",
         )
-        data = json.loads(a.model_dump_json(by_alias=True))
+        data = json.loads(assignment.model_dump_json(by_alias=True))
         assert data["type"] == "task_assignment"
         assert data["taskId"] == "1"
         assert data["assignedBy"] == "team-lead"
 
     def test_shutdown_request(self):
-        r = ShutdownRequest(
+        request = ShutdownRequest(
             request_id="shutdown-1770398300000@worker",
             from_="team-lead",
             reason="Done",
             timestamp="ts",
         )
-        data = json.loads(r.model_dump_json(by_alias=True))
+        data = json.loads(request.model_dump_json(by_alias=True))
         assert data["type"] == "shutdown_request"
         assert data["requestId"] == "shutdown-1770398300000@worker"
         assert data["from"] == "team-lead"
 
     def test_shutdown_approved(self):
-        a = ShutdownApproved(
+        approval = ShutdownApproved(
             request_id="shutdown-123@worker",
             from_="worker",
             timestamp="ts",
             pane_id="%34",
             backend_type="tmux",
         )
-        data = json.loads(a.model_dump_json(by_alias=True))
+        data = json.loads(approval.model_dump_json(by_alias=True))
         assert data["type"] == "shutdown_approved"
         assert data["paneId"] == "%34"
         assert data["backendType"] == "tmux"
@@ -293,27 +299,30 @@ class TestStructuredMessages:
 
 class TestToolReturnModels:
     def test_team_create_result(self):
-        r = TeamCreateResult(
+        result = TeamCreateResult(
             team_name="t",
             team_file_path="/p",
             lead_agent_id="team-lead@t",
         )
-        assert r.team_name == "t"
+        assert result.team_name == "t"
 
     def test_team_delete_result(self):
-        r = TeamDeleteResult(
+        result = TeamDeleteResult(
             success=True,
             message='Cleaned up directories and worktrees for team "t"',
             team_name="t",
         )
-        assert r.success is True
+        assert result.success is True
 
     def test_spawn_result(self):
-        r = SpawnResult(agent_id="w@t", name="w", team_name="t")
-        assert r.message == "The agent is now running and will receive instructions via mailbox."
+        result = SpawnResult(agent_id="w@t", name="w", team_name="t")
+        assert (
+            result.message
+            == "The agent is now running and will receive instructions via mailbox."
+        )
 
     def test_send_message_result(self):
-        r = SendMessageResult(success=True, message="sent")
-        data = r.model_dump(exclude_none=True)
+        result = SendMessageResult(success=True, message="sent")
+        data = result.model_dump(exclude_none=True)
         assert "routing" not in data
         assert "request_id" not in data

@@ -10,16 +10,20 @@ requires-python = ">=3.12"
 license = "MIT"
 dependencies = [
     "fastmcp==3.0.0b1",
+    "typer>=0.21.1",
+    "rich>=13.0",
+    "claude-code-tools>=1.10.0",
 ]
 
 [dependency-groups]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+    "pytest-cov>=7.0.0",
 ]
 
 [project.scripts]
-claude-teams = "claude_teams.server:main"
+claude-teams = "claude_teams.cli:app"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/claude_teams"]

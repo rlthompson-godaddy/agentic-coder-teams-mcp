@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -67,8 +65,8 @@ class TestAssignColor:
         assert color == "blue"
 
     def test_cycles(self, team_dir: Path) -> None:
-        for i in range(len(COLOR_PALETTE)):
-            member = _make_member(f"agent-{i}", color=COLOR_PALETTE[i])
+        for idx in range(len(COLOR_PALETTE)):
+            member = _make_member(f"agent-{idx}", color=COLOR_PALETTE[idx])
             teams.add_member(TEAM, member, base_dir=team_dir)
 
         color = assign_color(TEAM, base_dir=team_dir)
@@ -89,7 +87,7 @@ class TestBuildSpawnCommand:
         assert "--parent-session-id" in cmd
         assert "--agent-type" in cmd
         assert "--model" in cmd
-        assert f"cd /tmp" in cmd
+        assert "cd /tmp" in cmd
         assert "--plan-mode-required" not in cmd
 
     def test_with_plan_mode(self) -> None:
@@ -102,27 +100,35 @@ class TestBuildSpawnCommand:
 class TestSpawnTeammateNameValidation:
     def test_should_reject_empty_name(self, team_dir: Path) -> None:
         with pytest.raises(ValueError, match="Invalid"):
-            spawn_teammate(TEAM, "", "prompt", "/bin/echo", SESSION_ID, base_dir=team_dir)
+            spawn_teammate(
+                TEAM, "", "prompt", "/bin/echo", SESSION_ID, base_dir=team_dir
+            )
 
     def test_should_reject_name_with_special_chars(self, team_dir: Path) -> None:
         with pytest.raises(ValueError, match="Invalid"):
-            spawn_teammate(TEAM, "agent!@#", "prompt", "/bin/echo", SESSION_ID, base_dir=team_dir)
+            spawn_teammate(
+                TEAM, "agent!@#", "prompt", "/bin/echo", SESSION_ID, base_dir=team_dir
+            )
 
     def test_should_reject_name_exceeding_64_chars(self, team_dir: Path) -> None:
         with pytest.raises(ValueError, match="too long"):
-            spawn_teammate(TEAM, "a" * 65, "prompt", "/bin/echo", SESSION_ID, base_dir=team_dir)
+            spawn_teammate(
+                TEAM, "a" * 65, "prompt", "/bin/echo", SESSION_ID, base_dir=team_dir
+            )
 
     def test_should_reject_reserved_name_team_lead(self, team_dir: Path) -> None:
         with pytest.raises(ValueError, match="reserved"):
-            spawn_teammate(TEAM, "team-lead", "prompt", "/bin/echo", SESSION_ID, base_dir=team_dir)
+            spawn_teammate(
+                TEAM, "team-lead", "prompt", "/bin/echo", SESSION_ID, base_dir=team_dir
+            )
 
 
 class TestSpawnTeammate:
-    @patch("claude_teams.spawner.subprocess")
+    @patch("claude_teams.spawner.TmuxCLIController")
     def test_registers_member_before_spawn(
-        self, mock_subprocess: MagicMock, team_dir: Path
+        self, mock_ctrl_cls: MagicMock, team_dir: Path
     ) -> None:
-        mock_subprocess.run.return_value.stdout = "%42\n"
+        mock_ctrl_cls.return_value.launch_cli.return_value = "remote:1.0"
         spawn_teammate(
             TEAM,
             "researcher",
@@ -132,14 +138,14 @@ class TestSpawnTeammate:
             base_dir=team_dir,
         )
         config = teams.read_config(TEAM, base_dir=team_dir)
-        names = [m.name for m in config.members]
+        names = [member.name for member in config.members]
         assert "researcher" in names
 
-    @patch("claude_teams.spawner.subprocess")
+    @patch("claude_teams.spawner.TmuxCLIController")
     def test_writes_prompt_to_inbox(
-        self, mock_subprocess: MagicMock, team_dir: Path
+        self, mock_ctrl_cls: MagicMock, team_dir: Path
     ) -> None:
-        mock_subprocess.run.return_value.stdout = "%42\n"
+        mock_ctrl_cls.return_value.launch_cli.return_value = "remote:1.0"
         spawn_teammate(
             TEAM,
             "researcher",
@@ -153,11 +159,9 @@ class TestSpawnTeammate:
         assert msgs[0].from_ == "team-lead"
         assert msgs[0].text == "Do research"
 
-    @patch("claude_teams.spawner.subprocess")
-    def test_updates_pane_id(
-        self, mock_subprocess: MagicMock, team_dir: Path
-    ) -> None:
-        mock_subprocess.run.return_value.stdout = "%42\n"
+    @patch("claude_teams.spawner.TmuxCLIController")
+    def test_updates_pane_id(self, mock_ctrl_cls: MagicMock, team_dir: Path) -> None:
+        mock_ctrl_cls.return_value.launch_cli.return_value = "remote:1.0"
         member = spawn_teammate(
             TEAM,
             "researcher",
@@ -166,16 +170,14 @@ class TestSpawnTeammate:
             SESSION_ID,
             base_dir=team_dir,
         )
-        assert member.tmux_pane_id == "%42"
+        assert member.tmux_pane_id == "remote:1.0"
         config = teams.read_config(TEAM, base_dir=team_dir)
-        found = [m for m in config.members if m.name == "researcher"]
-        assert found[0].tmux_pane_id == "%42"
+        found = [member for member in config.members if member.name == "researcher"]
+        assert found[0].tmux_pane_id == "remote:1.0"
 
 
 class TestKillTmuxPane:
-    @patch("claude_teams.spawner.subprocess")
-    def test_calls_subprocess(self, mock_subprocess: MagicMock) -> None:
+    @patch("claude_teams.spawner.TmuxCLIController")
+    def test_calls_controller_kill_pane(self, mock_ctrl_cls: MagicMock) -> None:
         kill_tmux_pane("%99")
-        mock_subprocess.run.assert_called_once_with(
-            ["tmux", "kill-pane", "-t", "%99"], check=False
-        )
+        mock_ctrl_cls.return_value.kill_pane.assert_called_once_with(pane_id="%99")

@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import json
 import os
 import re
@@ -32,6 +30,15 @@ def _tasks_dir(base_dir: Path | None = None) -> Path:
 
 
 def team_exists(name: str, base_dir: Path | None = None) -> bool:
+    """Check if a team configuration file exists.
+
+    Args:
+        name (str): Name of the team.
+        base_dir (Path | None): Override for the base config directory.
+
+    Returns:
+        bool: True if the team's config.json exists.
+    """
     config_path = _teams_dir(base_dir) / name / "config.json"
     return config_path.exists()
 
@@ -43,10 +50,29 @@ def create_team(
     lead_model: str = "claude-opus-4-6",
     base_dir: Path | None = None,
 ) -> TeamCreateResult:
+    """Create a new team directory structure and configuration file.
+
+    Args:
+        name (str): Name of the team (alphanumeric, hyphens, underscores only).
+        session_id (str): Session ID for the team lead.
+        description (str): Optional team description.
+        lead_model (str): Model to use for the team lead agent.
+        base_dir (Path | None): Override for the base config directory.
+
+    Returns:
+        TeamCreateResult: Information about the created team.
+
+    Raises:
+        ValueError: If team name is invalid or exceeds 64 characters.
+    """
     if not _VALID_NAME_RE.match(name):
-        raise ValueError(f"Invalid team name: {name!r}. Use only letters, numbers, hyphens, underscores.")
+        raise ValueError(
+            f"Invalid team name: {name!r}. Use only letters, numbers, hyphens, underscores."
+        )
     if len(name) > 64:
-        raise ValueError(f"Team name too long ({len(name)} chars, max 64): {name[:20]!r}...")
+        raise ValueError(
+            f"Team name too long ({len(name)} chars, max 64): {name[:20]!r}..."
+        )
 
     teams_dir = _teams_dir(base_dir)
     tasks_dir = _tasks_dir(base_dir)
@@ -90,12 +116,35 @@ def create_team(
 
 
 def read_config(name: str, base_dir: Path | None = None) -> TeamConfig:
+    """Read and parse a team's configuration file.
+
+    Args:
+        name (str): Name of the team.
+        base_dir (Path | None): Override for the base config directory.
+
+    Returns:
+        TeamConfig: Parsed team configuration object.
+
+    Raises:
+        FileNotFoundError: If the team config does not exist.
+        json.JSONDecodeError: If the config file is malformed.
+    """
     config_path = _teams_dir(base_dir) / name / "config.json"
     raw = json.loads(config_path.read_text())
     return TeamConfig.model_validate(raw)
 
 
 def write_config(name: str, config: TeamConfig, base_dir: Path | None = None) -> None:
+    """Write team configuration to disk atomically.
+
+    Args:
+        name (str): Name of the team.
+        config (TeamConfig): Configuration object to serialize and write.
+        base_dir (Path | None): Override for the base config directory.
+
+    Raises:
+        OSError: If file creation or write fails.
+    """
     config_dir = _teams_dir(base_dir) / name
     data = json.dumps(config.model_dump(by_alias=True), indent=2)
 
@@ -115,9 +164,24 @@ def write_config(name: str, config: TeamConfig, base_dir: Path | None = None) ->
 
 
 def delete_team(name: str, base_dir: Path | None = None) -> TeamDeleteResult:
+    """Delete a team's directories and configuration after validation.
+
+    Args:
+        name (str): Name of the team to delete.
+        base_dir (Path | None): Override for the base config directory.
+
+    Returns:
+        TeamDeleteResult: Result containing success status and cleanup message.
+
+    Raises:
+        RuntimeError: If non-lead members are still present in the team.
+        FileNotFoundError: If the team does not exist.
+    """
     config = read_config(name, base_dir=base_dir)
 
-    non_lead = [m for m in config.members if isinstance(m, TeammateMember)]
+    non_lead = [
+        member for member in config.members if isinstance(member, TeammateMember)
+    ]
     if non_lead:
         raise RuntimeError(
             f"Cannot delete team {name!r}: {len(non_lead)} non-lead member(s) still present. "
@@ -135,17 +199,41 @@ def delete_team(name: str, base_dir: Path | None = None) -> TeamDeleteResult:
 
 
 def add_member(name: str, member: TeammateMember, base_dir: Path | None = None) -> None:
+    """Add a new teammate member to an existing team.
+
+    Args:
+        name (str): Name of the team.
+        member (TeammateMember): Teammate member object to add.
+        base_dir (Path | None): Override for the base config directory.
+
+    Raises:
+        ValueError: If a member with the same name already exists in the team.
+        FileNotFoundError: If the team does not exist.
+    """
     config = read_config(name, base_dir=base_dir)
-    existing_names = {m.name for m in config.members}
+    existing_names = {member_item.name for member_item in config.members}
     if member.name in existing_names:
         raise ValueError(f"Member {member.name!r} already exists in team {name!r}")
     config.members.append(member)
     write_config(name, config, base_dir=base_dir)
 
 
-def remove_member(team_name: str, agent_name: str, base_dir: Path | None = None) -> None:
+def remove_member(
+    team_name: str, agent_name: str, base_dir: Path | None = None
+) -> None:
+    """Remove a teammate member from a team by agent name.
+
+    Args:
+        team_name (str): Name of the team.
+        agent_name (str): Name of the agent to remove from the team.
+        base_dir (Path | None): Override for the base config directory.
+
+    Raises:
+        ValueError: If attempting to remove the team-lead agent.
+        FileNotFoundError: If the team does not exist.
+    """
     if agent_name == "team-lead":
         raise ValueError("Cannot remove team-lead from team")
     config = read_config(team_name, base_dir=base_dir)
-    config.members = [m for m in config.members if m.name != agent_name]
+    config.members = [member for member in config.members if member.name != agent_name]
     write_config(team_name, config, base_dir=base_dir)
