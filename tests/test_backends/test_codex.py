@@ -109,6 +109,19 @@ class TestCodexBuildCommand:
         idx = cmd.index("-C")
         assert cmd[idx + 1] == "/my/project"
 
+    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/codex")
+    def test_includes_output_file_flag_when_extra_path_provided(self, mock_which):
+        backend = CodexBackend()
+        request = _make_request(
+            extra={"output_last_message_path": "/tmp/codex-last-message.txt"}
+        )
+
+        cmd = backend.build_command(request)
+
+        assert "--output-last-message" in cmd
+        idx = cmd.index("--output-last-message")
+        assert cmd[idx + 1] == "/tmp/codex-last-message.txt"
+
 
 class TestCodexBuildEnv:
     def test_returns_empty_dict(self):

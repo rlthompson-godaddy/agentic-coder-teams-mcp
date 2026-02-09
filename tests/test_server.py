@@ -1,4 +1,5 @@
 import json
+import asyncio
 import time
 from pathlib import Path
 from typing import cast
@@ -198,6 +199,104 @@ class TestProgressiveDisclosure:
         tool_list = await client.list_tools()
         names = {t.name for t in tool_list}
         assert "spawn_teammate" in names
+
+
+class TestOneShotBackendRelay:
+    async def test_should_relay_codex_result_to_team_lead(self, client: Client):
+        await client.call_tool("team_create", {"team_name": "oneshot"})
+
+        mock_codex = _make_mock_backend("codex")
+
+        def _spawn_side_effect(request):
+            output_path = Path(request.extra["output_last_message_path"])
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text("codex teammate result")
+            return BackendSpawnResult(process_handle="%codex", backend_type="codex")
+
+        mock_codex.spawn.side_effect = _spawn_side_effect
+        mock_codex.health_check.return_value = HealthStatus(
+            alive=False,
+            detail="one-shot complete",
+        )
+        _registry._backends["codex"] = mock_codex
+
+        await client.call_tool(
+            "spawn_teammate",
+            {
+                "team_name": "oneshot",
+                "name": "codex-worker",
+                "backend": "codex",
+                "model": "gpt-5.3-codex",
+                "prompt": "reply with result",
+            },
+        )
+
+        await asyncio.sleep(0.1)
+
+        inbox = _data(
+            await client.call_tool(
+                "read_inbox",
+                {
+                    "team_name": "oneshot",
+                    "agent_name": "team-lead",
+                    "unread_only": True,
+                },
+            )
+        )
+        assert len(inbox) == 1
+        assert inbox[0]["from"] == "codex-worker"
+        assert inbox[0]["summary"] == "teammate_result"
+        assert "codex teammate result" in inbox[0]["text"]
+
+    async def test_should_relay_when_output_exists_even_if_pane_is_alive(
+        self, client: Client
+    ):
+        await client.call_tool("team_create", {"team_name": "oneshot-alive"})
+
+        mock_codex = _make_mock_backend("codex")
+
+        def _spawn_side_effect(request):
+            output_path = Path(request.extra["output_last_message_path"])
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text("codex pane-still-alive result")
+            return BackendSpawnResult(
+                process_handle="%codex-alive", backend_type="codex"
+            )
+
+        mock_codex.spawn.side_effect = _spawn_side_effect
+        mock_codex.health_check.return_value = HealthStatus(
+            alive=True,
+            detail="tmux pane still open",
+        )
+        _registry._backends["codex"] = mock_codex
+
+        await client.call_tool(
+            "spawn_teammate",
+            {
+                "team_name": "oneshot-alive",
+                "name": "codex-worker",
+                "backend": "codex",
+                "model": "gpt-5.3-codex",
+                "prompt": "reply with result",
+            },
+        )
+
+        await asyncio.sleep(0.1)
+
+        inbox = _data(
+            await client.call_tool(
+                "read_inbox",
+                {
+                    "team_name": "oneshot-alive",
+                    "agent_name": "team-lead",
+                    "unread_only": True,
+                },
+            )
+        )
+        assert len(inbox) == 1
+        assert inbox[0]["from"] == "codex-worker"
+        assert inbox[0]["summary"] == "teammate_result"
+        assert "codex pane-still-alive result" in inbox[0]["text"]
 
 
 # ---------------------------------------------------------------------------

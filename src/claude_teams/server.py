@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 import signal
 import time
@@ -31,6 +32,10 @@ from claude_teams.teams import _VALID_NAME_RE
 _TAG_BOOTSTRAP = "bootstrap"
 _TAG_TEAM = "team"
 _TAG_TEAMMATE = "teammate"
+_ONE_SHOT_BACKENDS = {"codex"}
+_ONE_SHOT_RESULT_MAX_CHARS = 12000
+
+logger = logging.getLogger(__name__)
 
 
 class _LifespanState(TypedDict):
@@ -208,6 +213,12 @@ async def spawn_teammate_tool(
     messaging.append_message(team_name, name, initial_msg)
 
     # Spawn via backend
+    extra: dict[str, str] | None = None
+    one_shot_result_path: Path | None = None
+    if backend_obj.name in _ONE_SHOT_BACKENDS:
+        one_shot_result_path = _create_one_shot_result_path(team_name, name)
+        extra = {"output_last_message_path": str(one_shot_result_path)}
+
     request = SpawnRequest(
         agent_id=member.agent_id,
         name=name,
@@ -219,6 +230,7 @@ async def spawn_teammate_tool(
         cwd=cwd,
         lead_session_id=ls["session_id"],
         plan_mode_required=plan_mode_required,
+        extra=extra,
     )
     try:
         spawn_result = backend_obj.spawn(request)
@@ -238,6 +250,18 @@ async def spawn_teammate_tool(
     if not ls["has_teammates"]:
         ls["has_teammates"] = True
         await ctx.enable_components(tags={_TAG_TEAMMATE}, components={"tool"})
+
+    if one_shot_result_path is not None:
+        asyncio.create_task(
+            _relay_one_shot_result(
+                team_name=team_name,
+                agent_name=name,
+                backend_type=backend_obj.name,
+                process_handle=spawn_result.process_handle,
+                result_file=one_shot_result_path,
+                color=color,
+            )
+        )
 
     return SpawnResult(
         agent_id=member.agent_id,
@@ -662,6 +686,86 @@ def health_check(team_name: str, agent_name: str, ctx: Context) -> dict:
         "backend": backend_type,
         "detail": status.detail,
     }
+
+
+def _create_one_shot_result_path(team_name: str, agent_name: str) -> Path:
+    runs_dir = messaging.TEAMS_DIR / team_name / "runs"
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = int(time.time() * 1000)
+    return runs_dir / f"{agent_name}-{timestamp}.last-message.txt"
+
+
+async def _relay_one_shot_result(
+    team_name: str,
+    agent_name: str,
+    backend_type: str,
+    process_handle: str,
+    result_file: Path,
+    color: str,
+) -> None:
+    deadline = time.time() + 900
+    backend_obj = None
+    text = ""
+
+    try:
+        backend_obj = registry.get(backend_type)
+    except KeyError:
+        logger.warning(
+            "One-shot backend not available for result relay: %s", backend_type
+        )
+
+    while time.time() < deadline:
+        try:
+            if result_file.exists():
+                text = result_file.read_text().strip()
+        except Exception:
+            logger.exception("Failed reading one-shot result file: %s", result_file)
+
+        if text:
+            break
+
+        if backend_obj is None:
+            await asyncio.sleep(0.5)
+            continue
+
+        status = backend_obj.health_check(process_handle)
+        if not status.alive:
+            break
+
+        await asyncio.sleep(0.5)
+
+    if not text:
+        try:
+            if result_file.exists():
+                text = result_file.read_text().strip()
+        except Exception:
+            logger.exception("Failed reading one-shot result file: %s", result_file)
+
+    if not text and time.time() >= deadline:
+        messaging.send_plain_message(
+            team_name,
+            agent_name,
+            "team-lead",
+            f"{agent_name} timed out before producing a one-shot result.",
+            summary="teammate_timeout",
+            color=color,
+        )
+        return
+
+    if not text:
+        text = f"{agent_name} ({backend_type}) finished, but no output was captured."
+
+    if len(text) > _ONE_SHOT_RESULT_MAX_CHARS:
+        text = text[:_ONE_SHOT_RESULT_MAX_CHARS] + "\n\n[truncated]"
+
+    messaging.send_plain_message(
+        team_name,
+        agent_name,
+        "team-lead",
+        text,
+        summary="teammate_result",
+        color=color,
+    )
 
 
 def main():
