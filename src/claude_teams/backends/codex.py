@@ -58,7 +58,7 @@ class CodexBackend(BaseBackend):
         """
         binary = self.discover_binary()
         model = self.resolve_model(request.model)
-        return [
+        cmd = [
             binary,
             "exec",
             "--model",
@@ -66,8 +66,14 @@ class CodexBackend(BaseBackend):
             "--full-auto",
             "-C",
             request.cwd,
-            request.prompt,
         ]
+
+        output_path = (request.extra or {}).get("output_last_message_path")
+        if output_path:
+            cmd.extend(["--output-last-message", output_path])
+
+        cmd.append(request.prompt)
+        return cmd
 
     def build_env(self, request: SpawnRequest) -> dict[str, str]:
         """Return Codex environment variables (none required).
