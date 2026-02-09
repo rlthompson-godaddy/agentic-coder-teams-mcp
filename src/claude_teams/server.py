@@ -1,4 +1,6 @@
 import asyncio
+import os
+import signal
 import time
 import uuid
 from pathlib import Path
@@ -26,10 +28,16 @@ from claude_teams.spawner import assign_color
 from claude_teams.teams import _VALID_NAME_RE
 
 
+_TAG_BOOTSTRAP = "bootstrap"
+_TAG_TEAM = "team"
+_TAG_TEAMMATE = "teammate"
+
+
 class _LifespanState(TypedDict):
     registry: BackendRegistry
     session_id: str
     active_team: str | None
+    has_teammates: bool
 
 
 @lifespan
@@ -47,6 +55,7 @@ async def app_lifespan(server):
         "registry": registry,
         "session_id": session_id,
         "active_team": None,
+        "has_teammates": False,
     }
 
 
@@ -58,6 +67,7 @@ mcp = FastMCP(
     ),
     lifespan=app_lifespan,
 )
+mcp.enable(tags={_TAG_BOOTSTRAP}, only=True, components={"tool"})
 
 
 def _get_lifespan(ctx: Context) -> _LifespanState:
@@ -72,8 +82,8 @@ def _get_lifespan(ctx: Context) -> _LifespanState:
     return cast(_LifespanState, ctx.lifespan_context)
 
 
-@mcp.tool
-def team_create(
+@mcp.tool(tags={_TAG_BOOTSTRAP})
+async def team_create(
     team_name: str,
     ctx: Context,
     description: str = "",
@@ -81,17 +91,6 @@ def team_create(
     """Create a new agent team. Sets up team config and task directories under ~/.claude/.
     One team per server session. Team names must be filesystem-safe
     (letters, numbers, hyphens, underscores).
-
-    Args:
-        team_name (str): Unique name for the new team.
-        ctx (Context): FastMCP context containing lifespan state.
-        description (str): Human-readable description of the team's purpose.
-
-    Returns:
-        dict: Result containing team name and success status.
-
-    Raises:
-        ToolError: If a team is already active in this session or team name is invalid.
     """
     ls = _get_lifespan(ctx)
     if ls.get("active_team"):
@@ -102,34 +101,28 @@ def team_create(
         name=team_name, session_id=ls["session_id"], description=description
     )
     ls["active_team"] = team_name
+    await ctx.enable_components(tags={_TAG_TEAM}, components={"tool"})
     return result.model_dump()
 
 
-@mcp.tool
-def team_delete(team_name: str, ctx: Context) -> dict:
+@mcp.tool(tags={_TAG_BOOTSTRAP})
+async def team_delete(team_name: str, ctx: Context) -> dict:
     """Delete a team and all its data. Fails if any teammates are still active.
     Removes both team config and task directories.
-
-    Args:
-        team_name (str): Name of the team to delete.
-        ctx (Context): FastMCP context containing lifespan state.
-
-    Returns:
-        dict: Result containing success status.
-
-    Raises:
-        ToolError: If team not found or teammates are still active.
     """
     try:
         result = teams.delete_team(team_name)
     except (RuntimeError, FileNotFoundError) as e:
         raise ToolError(str(e))
-    _get_lifespan(ctx)["active_team"] = None
+    ls = _get_lifespan(ctx)
+    ls["active_team"] = None
+    ls["has_teammates"] = False
+    await ctx.disable_components(tags={_TAG_TEAM, _TAG_TEAMMATE}, components={"tool"})
     return result.model_dump()
 
 
-@mcp.tool(name="spawn_teammate")
-def spawn_teammate_tool(
+@mcp.tool(name="spawn_teammate", tags={_TAG_TEAM})
+async def spawn_teammate_tool(
     team_name: str,
     name: str,
     prompt: str,
@@ -143,22 +136,6 @@ def spawn_teammate_tool(
     codex, gemini, opencode, aider. Models: use generic tiers
     (fast/balanced/powerful) or backend-specific names. Leave backend empty to
     use the default (claude-code if available).
-
-    Args:
-        team_name (str): Name of the team to spawn the teammate in.
-        name (str): Unique name for the new teammate.
-        prompt (str): Initial prompt/instructions for the teammate.
-        ctx (Context): FastMCP context containing lifespan state.
-        model (str): Model tier or backend-specific model name.
-        backend (str): Backend to use for spawning (empty for default).
-        subagent_type (str): Type of agent (e.g., 'general-purpose').
-        plan_mode_required (bool): Whether the agent requires plan mode.
-
-    Returns:
-        dict: SpawnResult with agent_id, name, and team_name.
-
-    Raises:
-        ToolError: If backend unavailable, model invalid, or name conflicts.
     """
     ls = _get_lifespan(ctx)
     reg = ls["registry"]
@@ -258,6 +235,10 @@ def spawn_teammate_tool(
             break
     teams.write_config(team_name, config)
 
+    if not ls["has_teammates"]:
+        ls["has_teammates"] = True
+        await ctx.enable_components(tags={_TAG_TEAMMATE}, components={"tool"})
+
     return SpawnResult(
         agent_id=member.agent_id,
         name=member.name,
@@ -265,7 +246,7 @@ def spawn_teammate_tool(
     ).model_dump()
 
 
-@mcp.tool
+@mcp.tool(tags={_TAG_TEAM})
 def send_message(
     team_name: str,
     type: Literal[
@@ -288,22 +269,6 @@ def send_message(
     Type 'shutdown_request' asks a teammate to shut down (requires recipient; content used as reason).
     Type 'shutdown_response' responds to a shutdown request (requires sender, request_id, approve).
     Type 'plan_approval_response' responds to a plan approval request (requires recipient, request_id, approve).
-
-    Args:
-        team_name (str): Name of the team.
-        type (Literal): Message type (message, broadcast, shutdown_request, shutdown_response, plan_approval_response).
-        recipient (str): Target agent name for direct messages.
-        content (str): Message content/body.
-        summary (str): Brief message summary.
-        request_id (str): ID of the request being responded to.
-        approve (bool | None): Whether to approve a request.
-        sender (str): Name of the sending agent.
-
-    Returns:
-        dict: SendMessageResult with success status and routing details.
-
-    Raises:
-        ToolError: If required fields are missing or recipient not found.
     """
 
     if type == "message":
@@ -459,7 +424,7 @@ def send_message(
     raise ToolError(f"Unknown message type: {type}")
 
 
-@mcp.tool
+@mcp.tool(tags={_TAG_TEAM})
 def task_create(
     team_name: str,
     subject: str,
@@ -469,19 +434,6 @@ def task_create(
 ) -> dict:
     """Create a new task for the team. Tasks are auto-assigned incrementing IDs.
     Optional metadata dict is stored alongside the task.
-
-    Args:
-        team_name (str): Name of the team.
-        subject (str): Brief task title.
-        description (str): Detailed task description.
-        active_form (str): Present continuous form for in-progress display.
-        metadata (dict | None): Optional metadata dictionary.
-
-    Returns:
-        dict: Created task with id, subject, status, and other fields.
-
-    Raises:
-        ToolError: If team not found or task creation fails.
     """
     try:
         task = tasks.create_task(team_name, subject, description, active_form, metadata)
@@ -490,7 +442,7 @@ def task_create(
     return task.model_dump(by_alias=True, exclude_none=True)
 
 
-@mcp.tool
+@mcp.tool(tags={_TAG_TEAM})
 def task_update(
     team_name: str,
     task_id: str,
@@ -506,24 +458,6 @@ def task_update(
     """Update a task's fields. Setting owner auto-notifies the assignee via
     inbox. Setting status to 'deleted' removes the task file from disk.
     Metadata keys are merged into existing metadata (set a key to null to delete it).
-
-    Args:
-        team_name (str): Name of the team.
-        task_id (str): ID of the task to update.
-        status (Literal | None): New status (pending, in_progress, completed, deleted).
-        owner (str | None): Name of the agent to assign the task to.
-        subject (str | None): New task subject.
-        description (str | None): New task description.
-        active_form (str | None): New active form.
-        add_blocks (list[str] | None): Task IDs this task blocks.
-        add_blocked_by (list[str] | None): Task IDs that block this task.
-        metadata (dict | None): Metadata to merge (set key to null to delete).
-
-    Returns:
-        dict: Updated task with all fields.
-
-    Raises:
-        ToolError: If task not found or update fails.
     """
     try:
         task = tasks.update_task(
@@ -547,19 +481,9 @@ def task_update(
     return task.model_dump(by_alias=True, exclude_none=True)
 
 
-@mcp.tool
+@mcp.tool(tags={_TAG_TEAM})
 def task_list(team_name: str) -> list[dict]:
-    """List all tasks for a team with their current status and assignments.
-
-    Args:
-        team_name (str): Name of the team.
-
-    Returns:
-        list[dict]: List of tasks with id, subject, status, owner, etc.
-
-    Raises:
-        ToolError: If team not found or task listing fails.
-    """
+    """List all tasks for a team with their current status and assignments."""
     try:
         result = tasks.list_tasks(team_name)
     except ValueError as e:
@@ -567,20 +491,9 @@ def task_list(team_name: str) -> list[dict]:
     return [task.model_dump(by_alias=True, exclude_none=True) for task in result]
 
 
-@mcp.tool
+@mcp.tool(tags={_TAG_TEAM})
 def task_get(team_name: str, task_id: str) -> dict:
-    """Get full details of a specific task by ID.
-
-    Args:
-        team_name (str): Name of the team.
-        task_id (str): ID of the task to retrieve.
-
-    Returns:
-        dict: Complete task details including all fields.
-
-    Raises:
-        ToolError: If task not found.
-    """
+    """Get full details of a specific task by ID."""
     try:
         task = tasks.get_task(team_name, task_id)
     except FileNotFoundError:
@@ -588,7 +501,7 @@ def task_get(team_name: str, task_id: str) -> dict:
     return task.model_dump(by_alias=True, exclude_none=True)
 
 
-@mcp.tool
+@mcp.tool(tags={_TAG_TEAM})
 def read_inbox(
     team_name: str,
     agent_name: str,
@@ -597,15 +510,6 @@ def read_inbox(
 ) -> list[dict]:
     """Read messages from an agent's inbox. Returns all messages by default.
     Set unread_only=True to get only unprocessed messages.
-
-    Args:
-        team_name (str): Name of the team.
-        agent_name (str): Name of the agent whose inbox to read.
-        unread_only (bool): Whether to return only unread messages.
-        mark_as_read (bool): Whether to mark returned messages as read.
-
-    Returns:
-        list[dict]: List of inbox messages with from, text, timestamp, read status.
     """
     msgs = messaging.read_inbox(
         team_name, agent_name, unread_only=unread_only, mark_as_read=mark_as_read
@@ -613,19 +517,9 @@ def read_inbox(
     return [msg.model_dump(by_alias=True, exclude_none=True) for msg in msgs]
 
 
-@mcp.tool
+@mcp.tool(tags={_TAG_BOOTSTRAP})
 def read_config(team_name: str) -> dict:
-    """Read the current team configuration including all members.
-
-    Args:
-        team_name (str): Name of the team.
-
-    Returns:
-        dict: Team config with name, description, lead_agent_id, members list.
-
-    Raises:
-        ToolError: If team not found.
-    """
+    """Read the current team configuration including all members."""
     try:
         config = teams.read_config(team_name)
     except FileNotFoundError:
@@ -633,20 +527,10 @@ def read_config(team_name: str) -> dict:
     return config.model_dump(by_alias=True)
 
 
-@mcp.tool
+@mcp.tool(tags={_TAG_TEAMMATE})
 def force_kill_teammate(team_name: str, agent_name: str) -> dict:
     """Forcibly kill a teammate. Uses the teammate's registered backend to
     perform the kill. Removes member from config and resets their tasks.
-
-    Args:
-        team_name (str): Name of the team.
-        agent_name (str): Name of the teammate to kill.
-
-    Returns:
-        dict: Success status and message.
-
-    Raises:
-        ToolError: If teammate not found in team.
     """
     config = teams.read_config(team_name)
     member = None
@@ -680,7 +564,7 @@ def force_kill_teammate(team_name: str, agent_name: str) -> dict:
     return {"success": True, "message": f"{agent_name} has been stopped."}
 
 
-@mcp.tool
+@mcp.tool(tags={_TAG_TEAMMATE})
 async def poll_inbox(
     team_name: str,
     agent_name: str,
@@ -689,14 +573,6 @@ async def poll_inbox(
     """Poll an agent's inbox for new unread messages, waiting up to timeout_ms.
     Returns unread messages and marks them as read. Convenience tool for MCP
     clients that cannot watch the filesystem.
-
-    Args:
-        team_name (str): Name of the team.
-        agent_name (str): Name of the agent whose inbox to poll.
-        timeout_ms (int): Maximum time to wait in milliseconds.
-
-    Returns:
-        list[dict]: List of unread messages (empty if timeout reached).
     """
     msgs = messaging.read_inbox(
         team_name, agent_name, unread_only=True, mark_as_read=True
@@ -714,20 +590,10 @@ async def poll_inbox(
     return []
 
 
-@mcp.tool
+@mcp.tool(tags={_TAG_TEAMMATE})
 def process_shutdown_approved(team_name: str, agent_name: str) -> dict:
     """Process a teammate's shutdown by removing them from config and resetting
     their tasks. Call this after confirming shutdown_approved in the lead inbox.
-
-    Args:
-        team_name (str): Name of the team.
-        agent_name (str): Name of the teammate to remove.
-
-    Returns:
-        dict: Success status and message.
-
-    Raises:
-        ToolError: If agent_name is 'team-lead'.
     """
     if agent_name == "team-lead":
         raise ToolError("Cannot process shutdown for team-lead")
@@ -736,16 +602,10 @@ def process_shutdown_approved(team_name: str, agent_name: str) -> dict:
     return {"success": True, "message": f"{agent_name} removed from team."}
 
 
-@mcp.tool
+@mcp.tool(tags={_TAG_BOOTSTRAP})
 def list_backends(ctx: Context) -> list[dict]:
     """List all available spawner backends with their supported models.
     Returns backend name, binary, availability, default model, and model options.
-
-    Args:
-        ctx (Context): FastMCP context containing lifespan state.
-
-    Returns:
-        list[dict]: List of backend info dicts with name, binary, models.
     """
     ls = _get_lifespan(ctx)
     reg = ls["registry"]
@@ -762,21 +622,10 @@ def list_backends(ctx: Context) -> list[dict]:
     return result
 
 
-@mcp.tool
+@mcp.tool(tags={_TAG_TEAMMATE})
 def health_check(team_name: str, agent_name: str, ctx: Context) -> dict:
     """Check if a teammate's process is still running.
     Uses the teammate's registered backend for the health check.
-
-    Args:
-        team_name (str): Name of the team.
-        agent_name (str): Name of the teammate to check.
-        ctx (Context): FastMCP context containing lifespan state.
-
-    Returns:
-        dict: Health status with agent_name, alive, backend, detail.
-
-    Raises:
-        ToolError: If team or teammate not found, or backend unavailable.
     """
     try:
         config = teams.read_config(team_name)
@@ -817,6 +666,7 @@ def health_check(team_name: str, agent_name: str, ctx: Context) -> dict:
 
 def main():
     """Entry point for the claude-teams MCP server."""
+    signal.signal(signal.SIGINT, lambda *_: os._exit(0))
     mcp.run()
 
 

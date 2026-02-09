@@ -78,6 +78,21 @@ async def client(tmp_path: Path, monkeypatch):
     _registry._backends = {}
 
 
+@pytest.fixture
+async def team_client(client: Client):
+    """Client with a team created and a teammate spawned (all tiers unlocked)."""
+    await client.call_tool("team_create", {"team_name": "test-team"})
+    await client.call_tool(
+        "spawn_teammate",
+        {
+            "team_name": "test-team",
+            "name": "worker",
+            "prompt": "help out",
+        },
+    )
+    return client
+
+
 def _text(result) -> str:
     """Extract text from the first content item of a tool result."""
     item = result.content[0]
@@ -92,6 +107,104 @@ def _data(result):
     return result.data
 
 
+# ---------------------------------------------------------------------------
+# Progressive disclosure tests
+# ---------------------------------------------------------------------------
+
+
+class TestProgressiveDisclosure:
+    async def test_only_bootstrap_tools_at_startup(self, client: Client):
+        tool_list = await client.list_tools()
+        names = {t.name for t in tool_list}
+        # Bootstrap tools should be visible
+        assert "team_create" in names
+        assert "team_delete" in names
+        assert "list_backends" in names
+        assert "read_config" in names
+        # Team-tier tools should NOT be visible
+        assert "spawn_teammate" not in names
+        assert "send_message" not in names
+        assert "task_create" not in names
+        # Teammate-tier tools should NOT be visible
+        assert "force_kill_teammate" not in names
+        assert "poll_inbox" not in names
+        assert "health_check" not in names
+
+    async def test_team_tools_visible_after_create(self, client: Client):
+        await client.call_tool("team_create", {"team_name": "vis-test"})
+        tool_list = await client.list_tools()
+        names = {t.name for t in tool_list}
+        # Team-tier tools should now be visible
+        assert "spawn_teammate" in names
+        assert "send_message" in names
+        assert "task_create" in names
+        assert "task_update" in names
+        assert "task_list" in names
+        assert "task_get" in names
+        assert "read_inbox" in names
+        # Teammate-tier tools should still NOT be visible
+        assert "force_kill_teammate" not in names
+        assert "poll_inbox" not in names
+
+    async def test_teammate_tools_visible_after_spawn(self, client: Client):
+        await client.call_tool("team_create", {"team_name": "vis-test2"})
+        await client.call_tool(
+            "spawn_teammate",
+            {
+                "team_name": "vis-test2",
+                "name": "coder",
+                "prompt": "write code",
+            },
+        )
+        tool_list = await client.list_tools()
+        names = {t.name for t in tool_list}
+        # All tiers should be visible
+        assert "force_kill_teammate" in names
+        assert "poll_inbox" in names
+        assert "process_shutdown_approved" in names
+        assert "health_check" in names
+
+    async def test_tools_hidden_after_delete(self, client: Client):
+        await client.call_tool("team_create", {"team_name": "vis-del"})
+        await client.call_tool(
+            "spawn_teammate",
+            {
+                "team_name": "vis-del",
+                "name": "temp",
+                "prompt": "temporary",
+            },
+        )
+        # Remove member so delete succeeds
+        teams.remove_member("vis-del", "temp")
+        await client.call_tool("team_delete", {"team_name": "vis-del"})
+        tool_list = await client.list_tools()
+        names = {t.name for t in tool_list}
+        # Only bootstrap should remain
+        assert "team_create" in names
+        assert "list_backends" in names
+        assert "spawn_teammate" not in names
+        assert "force_kill_teammate" not in names
+
+    async def test_re_enable_cycle(self, client: Client):
+        # Create -> delete -> re-create cycle
+        await client.call_tool("team_create", {"team_name": "cycle1"})
+        await client.call_tool("team_delete", {"team_name": "cycle1"})
+        # After delete, team tools should be gone
+        tool_list = await client.list_tools()
+        names = {t.name for t in tool_list}
+        assert "spawn_teammate" not in names
+        # Re-create should bring them back
+        await client.call_tool("team_create", {"team_name": "cycle2"})
+        tool_list = await client.list_tools()
+        names = {t.name for t in tool_list}
+        assert "spawn_teammate" in names
+
+
+# ---------------------------------------------------------------------------
+# Existing tests — updated to use team_client where needed
+# ---------------------------------------------------------------------------
+
+
 class TestErrorPropagation:
     async def test_should_reject_second_team_in_same_session(self, client: Client):
         await client.call_tool("team_create", {"team_name": "alpha"})
@@ -101,11 +214,10 @@ class TestErrorPropagation:
         assert result.is_error is True
         assert "alpha" in _text(result)
 
-    async def test_should_reject_unknown_agent_in_force_kill(self, client: Client):
-        await client.call_tool("team_create", {"team_name": "t1"})
-        result = await client.call_tool(
+    async def test_should_reject_unknown_agent_in_force_kill(self, team_client: Client):
+        result = await team_client.call_tool(
             "force_kill_teammate",
-            {"team_name": "t1", "agent_name": "ghost"},
+            {"team_name": "test-team", "agent_name": "ghost"},
             raise_on_error=False,
         )
         assert result.is_error is True
@@ -441,11 +553,10 @@ class TestSendMessageValidation:
 
 
 class TestProcessShutdownGuard:
-    async def test_should_reject_shutdown_of_team_lead(self, client: Client):
-        await client.call_tool("team_create", {"team_name": "tsg"})
-        result = await client.call_tool(
+    async def test_should_reject_shutdown_of_team_lead(self, team_client: Client):
+        result = await team_client.call_tool(
             "process_shutdown_approved",
-            {"team_name": "tsg", "agent_name": "team-lead"},
+            {"team_name": "test-team", "agent_name": "team-lead"},
             raise_on_error=False,
         )
         assert result.is_error is True
@@ -483,6 +594,8 @@ class TestErrorWrapping:
         assert "not found" in _text(result).lower()
 
     async def test_task_create_wraps_nonexistent_team(self, client: Client):
+        # Create a team to unlock team-tier tools, then target a different team
+        await client.call_tool("team_create", {"team_name": "real-team"})
         result = await client.call_tool(
             "task_create",
             {"team_name": "ghost-team", "subject": "x", "description": "y"},
@@ -512,6 +625,8 @@ class TestErrorWrapping:
         assert "cannot transition" in _text(result).lower()
 
     async def test_task_list_wraps_nonexistent_team(self, client: Client):
+        # Create a team to unlock team-tier tools, then target a different team
+        await client.call_tool("team_create", {"team_name": "real-team2"})
         result = await client.call_tool(
             "task_list",
             {"team_name": "ghost-team"},
@@ -522,61 +637,55 @@ class TestErrorWrapping:
 
 
 class TestPollInbox:
-    async def test_should_return_empty_on_timeout(self, client: Client):
-        await client.call_tool("team_create", {"team_name": "t6"})
+    async def test_should_return_empty_on_timeout(self, team_client: Client):
         result = _data(
-            await client.call_tool(
+            await team_client.call_tool(
                 "poll_inbox",
-                {"team_name": "t6", "agent_name": "nobody", "timeout_ms": 100},
+                {"team_name": "test-team", "agent_name": "nobody", "timeout_ms": 100},
             )
         )
         assert result == []
 
-    async def test_should_return_messages_when_present(self, client: Client):
-        await client.call_tool("team_create", {"team_name": "t6b"})
-        teams.add_member("t6b", _make_teammate("alice", "t6b"))
-        await client.call_tool(
+    async def test_should_return_messages_when_present(self, team_client: Client):
+        await team_client.call_tool(
             "send_message",
             {
-                "team_name": "t6b",
+                "team_name": "test-team",
                 "type": "message",
-                "recipient": "alice",
+                "recipient": "worker",
                 "content": "wake up",
                 "summary": "nudge",
             },
         )
         result = _data(
-            await client.call_tool(
+            await team_client.call_tool(
                 "poll_inbox",
-                {"team_name": "t6b", "agent_name": "alice", "timeout_ms": 100},
+                {"team_name": "test-team", "agent_name": "worker", "timeout_ms": 100},
             )
         )
-        assert len(result) == 1
-        assert result[0]["text"] == "wake up"
+        # worker already has the initial prompt message + new message
+        assert any(msg["text"] == "wake up" for msg in result)
 
     async def test_should_return_existing_messages_with_zero_timeout(
-        self, client: Client
+        self, team_client: Client
     ):
-        await client.call_tool("team_create", {"team_name": "t6c"})
-        teams.add_member("t6c", _make_teammate("bob", "t6c"))
-        await client.call_tool(
+        await team_client.call_tool(
             "send_message",
             {
-                "team_name": "t6c",
+                "team_name": "test-team",
                 "type": "message",
-                "recipient": "bob",
+                "recipient": "worker",
                 "content": "instant",
                 "summary": "fast",
             },
         )
         result = _data(
-            await client.call_tool(
+            await team_client.call_tool(
                 "poll_inbox",
-                {"team_name": "t6c", "agent_name": "bob", "timeout_ms": 0},
+                {"team_name": "test-team", "agent_name": "worker", "timeout_ms": 0},
             )
         )
-        assert len(result) == 1
-        assert result[0]["text"] == "instant"
+        assert any(msg["text"] == "instant" for msg in result)
 
 
 class TestTeamDeleteErrorWrapping:
@@ -669,13 +778,10 @@ class TestListBackends:
 
 
 class TestHealthCheck:
-    async def test_returns_alive_for_running_teammate(self, client: Client):
-        await client.call_tool("team_create", {"team_name": "hc1"})
-        teams.add_member("hc1", _make_teammate("worker", "hc1", pane_id="%55"))
-
+    async def test_returns_alive_for_running_teammate(self, team_client: Client):
         result = _data(
-            await client.call_tool(
-                "health_check", {"team_name": "hc1", "agent_name": "worker"}
+            await team_client.call_tool(
+                "health_check", {"team_name": "test-team", "agent_name": "worker"}
             )
         )
 
@@ -684,10 +790,7 @@ class TestHealthCheck:
         assert "backend" in result
         assert "detail" in result
 
-    async def test_returns_dead_when_backend_says_dead(self, client: Client):
-        await client.call_tool("team_create", {"team_name": "hc2"})
-        teams.add_member("hc2", _make_teammate("deadworker", "hc2", pane_id="%56"))
-
+    async def test_returns_dead_when_backend_says_dead(self, team_client: Client):
         # Override mock to return dead
         mock_backend = cast(MagicMock, _registry._backends["claude-code"])
         mock_backend.health_check.return_value = HealthStatus(
@@ -695,8 +798,8 @@ class TestHealthCheck:
         )
 
         result = _data(
-            await client.call_tool(
-                "health_check", {"team_name": "hc2", "agent_name": "deadworker"}
+            await team_client.call_tool(
+                "health_check", {"team_name": "test-team", "agent_name": "worker"}
             )
         )
 
@@ -706,18 +809,17 @@ class TestHealthCheck:
             alive=True, detail="mock check"
         )
 
-    async def test_rejects_nonexistent_teammate(self, client: Client):
-        await client.call_tool("team_create", {"team_name": "hc3"})
-        result = await client.call_tool(
+    async def test_rejects_nonexistent_teammate(self, team_client: Client):
+        result = await team_client.call_tool(
             "health_check",
-            {"team_name": "hc3", "agent_name": "ghost"},
+            {"team_name": "test-team", "agent_name": "ghost"},
             raise_on_error=False,
         )
         assert result.is_error is True
         assert "ghost" in _text(result)
 
-    async def test_rejects_nonexistent_team(self, client: Client):
-        result = await client.call_tool(
+    async def test_rejects_nonexistent_team(self, team_client: Client):
+        result = await team_client.call_tool(
             "health_check",
             {"team_name": "no-such-team", "agent_name": "worker"},
             raise_on_error=False,
@@ -813,68 +915,66 @@ class TestSpawnWithBackend:
 
 
 class TestForceKillWithBackend:
-    async def test_kills_via_correct_backend(self, client: Client):
-        await client.call_tool("team_create", {"team_name": "fk1"})
-        mate = _make_teammate("victim", "fk1", pane_id="%77")
+    async def test_kills_via_correct_backend(self, team_client: Client):
+        mate = _make_teammate("victim", "test-team", pane_id="%77")
         mate.backend_type = "claude-code"
         mate.process_handle = "%77"
-        teams.add_member("fk1", mate)
+        teams.add_member("test-team", mate)
 
         mock_backend = cast(MagicMock, _registry._backends["claude-code"])
         mock_backend.kill.reset_mock()
 
         result = _data(
-            await client.call_tool(
+            await team_client.call_tool(
                 "force_kill_teammate",
-                {"team_name": "fk1", "agent_name": "victim"},
+                {"team_name": "test-team", "agent_name": "victim"},
             )
         )
 
         assert result["success"] is True
         mock_backend.kill.assert_called_once_with("%77")
 
-    async def test_legacy_tmux_backend_type_maps_to_claude_code(self, client: Client):
-        await client.call_tool("team_create", {"team_name": "fk2"})
-        mate = _make_teammate("oldmate", "fk2", pane_id="%88")
+    async def test_legacy_tmux_backend_type_maps_to_claude_code(
+        self, team_client: Client
+    ):
+        mate = _make_teammate("oldmate", "test-team", pane_id="%88")
         mate.backend_type = "tmux"
         mate.process_handle = "%88"
-        teams.add_member("fk2", mate)
+        teams.add_member("test-team", mate)
 
         mock_backend = cast(MagicMock, _registry._backends["claude-code"])
         mock_backend.kill.reset_mock()
 
         result = _data(
-            await client.call_tool(
+            await team_client.call_tool(
                 "force_kill_teammate",
-                {"team_name": "fk2", "agent_name": "oldmate"},
+                {"team_name": "test-team", "agent_name": "oldmate"},
             )
         )
 
         assert result["success"] is True
         mock_backend.kill.assert_called_once_with("%88")
 
-    async def test_rejects_nonexistent_teammate(self, client: Client):
-        await client.call_tool("team_create", {"team_name": "fk3"})
-        result = await client.call_tool(
+    async def test_rejects_nonexistent_teammate(self, team_client: Client):
+        result = await team_client.call_tool(
             "force_kill_teammate",
-            {"team_name": "fk3", "agent_name": "ghost"},
+            {"team_name": "test-team", "agent_name": "ghost"},
             raise_on_error=False,
         )
         assert result.is_error is True
         assert "ghost" in _text(result)
 
-    async def test_skips_kill_when_backend_unavailable(self, client: Client):
-        await client.call_tool("team_create", {"team_name": "fk4"})
-        mate = _make_teammate("orphan", "fk4", pane_id="%99")
+    async def test_skips_kill_when_backend_unavailable(self, team_client: Client):
+        mate = _make_teammate("orphan", "test-team", pane_id="%99")
         mate.backend_type = "nonexistent"
         mate.process_handle = "%99"
-        teams.add_member("fk4", mate)
+        teams.add_member("test-team", mate)
 
         # Should not raise even if backend is unavailable
         result = _data(
-            await client.call_tool(
+            await team_client.call_tool(
                 "force_kill_teammate",
-                {"team_name": "fk4", "agent_name": "orphan"},
+                {"team_name": "test-team", "agent_name": "orphan"},
             )
         )
         assert result["success"] is True

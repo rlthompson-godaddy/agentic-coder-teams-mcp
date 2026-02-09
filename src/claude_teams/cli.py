@@ -6,6 +6,8 @@ to ``fcntl.flock()`` guards in the core modules.
 """
 
 import json
+import os
+import signal
 from typing import Annotated
 
 import typer
@@ -45,6 +47,7 @@ JsonFlag = Annotated[
 @app.command()
 def serve() -> None:
     """Start the MCP server."""
+    signal.signal(signal.SIGINT, lambda *_: os._exit(0))
     mcp.run()
 
 

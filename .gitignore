@@ -16,3 +16,4 @@ venv/
 .mcp.json
 .omc
 docs/
+.coverage
