@@ -1,10 +1,9 @@
-import fcntl
 import json
 from collections import deque
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Literal
 
+from claude_teams.filelock import file_lock
 from claude_teams.models import TaskFile
 from claude_teams.teams import team_exists
 
@@ -12,25 +11,6 @@ from claude_teams.teams import team_exists
 _TaskStatus = Literal["pending", "in_progress", "completed", "deleted"]
 
 TASKS_DIR = Path.home() / ".claude" / "tasks"
-
-
-@contextmanager
-def file_lock(lock_path: Path):
-    """Context manager providing exclusive file-based lock using fcntl.
-
-    Args:
-        lock_path (Path): Path to the lock file (created if missing).
-
-    Yields:
-        None: Control returns to caller while lock is held.
-    """
-    lock_path.touch(exist_ok=True)
-    with open(lock_path) as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def _tasks_dir(base_dir: Path | None = None) -> Path:
@@ -174,6 +154,85 @@ def get_task(team_name: str, task_id: str, base_dir: Path | None = None) -> Task
     return TaskFile(**raw)
 
 
+def _link_dependency(
+    task: TaskFile,
+    task_id: str,
+    dep_ids: list[str],
+    forward_field: str,
+    inverse_field: str,
+    team_dir: Path,
+    pending_writes: dict[Path, TaskFile],
+) -> None:
+    """Add dependency links between tasks in both directions.
+
+    For each *dep_id* in *dep_ids*, appends it to ``task.{forward_field}``
+    and ensures ``task_id`` is added to the other task's ``{inverse_field}``.
+
+    Args:
+        task (TaskFile): The task being updated.
+        task_id (str): ID of the task being updated.
+        dep_ids (list[str]): IDs of tasks to link.
+        forward_field (str): Attribute on *task* (``"blocks"`` or ``"blocked_by"``).
+        inverse_field (str): Attribute on the other task.
+        team_dir (Path): Directory containing task JSON files.
+        pending_writes (dict[Path, TaskFile]): Accumulator for batched writes.
+    """
+    forward_list: list[str] = getattr(task, forward_field)
+    existing = set(forward_list)
+    for dep_id in dep_ids:
+        if dep_id not in existing:
+            forward_list.append(dep_id)
+            existing.add(dep_id)
+        dep_path = team_dir / f"{dep_id}.json"
+        if dep_path in pending_writes:
+            other = pending_writes[dep_path]
+        else:
+            other = TaskFile(**json.loads(dep_path.read_text()))
+        inverse_list: list[str] = getattr(other, inverse_field)
+        if task_id not in inverse_list:
+            inverse_list.append(task_id)
+        pending_writes[dep_path] = other
+
+
+def _remove_task_references(
+    task_id: str,
+    team_dir: Path,
+    pending_writes: dict[Path, TaskFile],
+    fields: tuple[str, ...] = ("blocked_by",),
+) -> None:
+    """Remove *task_id* from the specified fields across all sibling tasks.
+
+    Iterates every task file in *team_dir* (skipping *task_id* itself) and
+    removes *task_id* from each named list field.
+
+    Args:
+        task_id (str): ID to remove from other tasks' dependency lists.
+        team_dir (Path): Directory containing task JSON files.
+        pending_writes (dict[Path, TaskFile]): Accumulator for batched writes.
+        fields (tuple[str, ...]): Attribute names to clean
+            (e.g. ``("blocked_by",)`` or ``("blocked_by", "blocks")``).
+    """
+    for task_file in team_dir.glob("*.json"):
+        try:
+            int(task_file.stem)
+        except ValueError:
+            continue
+        if task_file.stem == task_id:
+            continue
+        if task_file in pending_writes:
+            other = pending_writes[task_file]
+        else:
+            other = TaskFile(**json.loads(task_file.read_text()))
+        changed = False
+        for field in fields:
+            dep_list: list[str] = getattr(other, field)
+            if task_id in dep_list:
+                dep_list.remove(task_id)
+                changed = True
+        if changed:
+            pending_writes[task_file] = other
+
+
 def update_task(
     team_name: str,
     task_id: str,
@@ -290,34 +349,26 @@ def update_task(
             task.owner = owner
 
         if add_blocks:
-            existing = set(task.blocks)
-            for blocked_id in add_blocks:
-                if blocked_id not in existing:
-                    task.blocks.append(blocked_id)
-                    existing.add(blocked_id)
-                blocked_id_path = team_dir / f"{blocked_id}.json"
-                if blocked_id_path in pending_writes:
-                    other = pending_writes[blocked_id_path]
-                else:
-                    other = TaskFile(**json.loads(blocked_id_path.read_text()))
-                if task_id not in other.blocked_by:
-                    other.blocked_by.append(task_id)
-                pending_writes[blocked_id_path] = other
+            _link_dependency(
+                task,
+                task_id,
+                add_blocks,
+                "blocks",
+                "blocked_by",
+                team_dir,
+                pending_writes,
+            )
 
         if add_blocked_by:
-            existing = set(task.blocked_by)
-            for blocked_id in add_blocked_by:
-                if blocked_id not in existing:
-                    task.blocked_by.append(blocked_id)
-                    existing.add(blocked_id)
-                blocked_id_path = team_dir / f"{blocked_id}.json"
-                if blocked_id_path in pending_writes:
-                    other = pending_writes[blocked_id_path]
-                else:
-                    other = TaskFile(**json.loads(blocked_id_path.read_text()))
-                if task_id not in other.blocks:
-                    other.blocks.append(task_id)
-                pending_writes[blocked_id_path] = other
+            _link_dependency(
+                task,
+                task_id,
+                add_blocked_by,
+                "blocked_by",
+                "blocks",
+                team_dir,
+                pending_writes,
+            )
 
         if metadata is not None:
             current = task.metadata or {}
@@ -331,43 +382,15 @@ def update_task(
         if status is not None and status != "deleted":
             task.status = status
             if status == "completed":
-                for task_file in team_dir.glob("*.json"):
-                    try:
-                        int(task_file.stem)
-                    except ValueError:
-                        continue
-                    if task_file.stem == task_id:
-                        continue
-                    if task_file in pending_writes:
-                        other = pending_writes[task_file]
-                    else:
-                        other = TaskFile(**json.loads(task_file.read_text()))
-                    if task_id in other.blocked_by:
-                        other.blocked_by.remove(task_id)
-                        pending_writes[task_file] = other
+                _remove_task_references(
+                    task_id, team_dir, pending_writes, ("blocked_by",)
+                )
 
         if status == "deleted":
             task.status = "deleted"
-            for task_file in team_dir.glob("*.json"):
-                try:
-                    int(task_file.stem)
-                except ValueError:
-                    continue
-                if task_file.stem == task_id:
-                    continue
-                if task_file in pending_writes:
-                    other = pending_writes[task_file]
-                else:
-                    other = TaskFile(**json.loads(task_file.read_text()))
-                changed = False
-                if task_id in other.blocked_by:
-                    other.blocked_by.remove(task_id)
-                    changed = True
-                if task_id in other.blocks:
-                    other.blocks.remove(task_id)
-                    changed = True
-                if changed:
-                    pending_writes[task_file] = other
+            _remove_task_references(
+                task_id, team_dir, pending_writes, ("blocked_by", "blocks")
+            )
 
         # --- Phase 4: Write ---
         if status == "deleted":

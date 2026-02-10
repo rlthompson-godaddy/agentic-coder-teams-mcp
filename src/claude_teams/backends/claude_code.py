@@ -7,6 +7,15 @@ class ClaudeCodeBackend(BaseBackend):
     _name = "claude-code"
     _binary_name = "claude"
 
+    @property
+    def is_interactive(self) -> bool:
+        """Claude Code runs as an interactive MCP client with native team messaging.
+
+        Returns:
+            bool: Always True.
+        """
+        return True
+
     _MODEL_MAP: dict[str, str] = {
         "fast": "haiku",
         "balanced": "sonnet",

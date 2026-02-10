@@ -35,6 +35,10 @@ class TestClaudeCodeProperties:
         backend = ClaudeCodeBackend()
         assert backend.binary_name == "claude"
 
+    def test_is_interactive(self):
+        backend = ClaudeCodeBackend()
+        assert backend.is_interactive is True
+
 
 class TestClaudeCodeSupportedModels:
     def test_returns_expected_models(self):

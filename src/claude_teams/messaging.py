@@ -1,12 +1,11 @@
-import fcntl
 import json
 import time
-from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
 from pydantic import BaseModel
 
+from claude_teams.filelock import file_lock
 from claude_teams.models import (
     InboxMessage,
     ShutdownRequest,
@@ -19,25 +18,6 @@ TEAMS_DIR = Path.home() / ".claude" / "teams"
 
 def _teams_dir(base_dir: Path | None = None) -> Path:
     return (base_dir / "teams") if base_dir else TEAMS_DIR
-
-
-@contextmanager
-def file_lock(lock_path: Path):
-    """Context manager providing exclusive file-based lock using fcntl.
-
-    Args:
-        lock_path (Path): Path to the lock file (created if missing).
-
-    Yields:
-        None: Control returns to caller while lock is held.
-    """
-    lock_path.touch(exist_ok=True)
-    with open(lock_path) as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def now_iso() -> str:

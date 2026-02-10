@@ -202,6 +202,23 @@ class TestBaseBackendController:
 # ---------------------------------------------------------------------------
 
 
+class TestBaseBackendIsInteractive:
+    def test_defaults_to_false(self):
+        backend = _StubBackend()
+        assert backend.is_interactive is False
+
+
+class TestBaseBackendRetainPaneAfterExit:
+    def test_sets_remain_on_exit_option(self):
+        backend, mock_ctrl = _make_backend_with_mock_controller()
+
+        backend.retain_pane_after_exit("%42")
+
+        mock_ctrl._run_tmux_command.assert_called_once_with(
+            ["set-option", "-p", "-t", "%42", "remain-on-exit", "on"]
+        )
+
+
 class TestBaseBackendIsAvailable:
     @patch("claude_teams.backends.base.shutil.which")
     def test_returns_true_when_binary_found(self, mock_which: MagicMock):
@@ -311,6 +328,7 @@ class TestBaseBackendHealthCheck:
             {"id": "%1", "formatted_id": "remote:1.0"},
             {"id": "%42", "formatted_id": "remote:1.1"},
         ]
+        mock_ctrl._run_tmux_command.return_value = ("0", 0)
 
         status = backend.health_check("%42")
 
@@ -323,10 +341,23 @@ class TestBaseBackendHealthCheck:
             {"id": "%1", "formatted_id": "remote:1.0"},
             {"id": "%42", "formatted_id": "remote:1.1"},
         ]
+        mock_ctrl._run_tmux_command.return_value = ("0", 0)
 
         status = backend.health_check("remote:1.1")
 
         assert status.alive is True
+
+    def test_returns_dead_when_process_exited_but_pane_retained(self):
+        backend, mock_ctrl = _make_backend_with_mock_controller()
+        mock_ctrl.list_panes.return_value = [
+            {"id": "%42", "formatted_id": "remote:1.1"},
+        ]
+        mock_ctrl._run_tmux_command.return_value = ("1", 0)
+
+        status = backend.health_check("%42")
+
+        assert status.alive is False
+        assert status.detail == "process exited (pane retained)"
 
     def test_returns_dead_when_pane_missing(self):
         backend, mock_ctrl = _make_backend_with_mock_controller()
@@ -337,6 +368,7 @@ class TestBaseBackendHealthCheck:
         status = backend.health_check("%42")
 
         assert status.alive is False
+        assert status.detail == "tmux pane not found"
 
     def test_returns_dead_when_no_panes(self):
         backend, mock_ctrl = _make_backend_with_mock_controller()
@@ -345,6 +377,7 @@ class TestBaseBackendHealthCheck:
         status = backend.health_check("%42")
 
         assert status.alive is False
+        assert status.detail == "tmux pane not found"
 
 
 # ---------------------------------------------------------------------------

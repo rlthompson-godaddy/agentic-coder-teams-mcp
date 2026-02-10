@@ -36,6 +36,7 @@ def _make_mock_backend(name: str = "claude-code") -> MagicMock:
     mock = MagicMock()
     mock.name = name
     mock.binary_name = "claude"
+    mock.is_interactive = name == "claude-code"
     mock.is_available.return_value = True
     mock.discover_binary.return_value = "/usr/bin/echo"
     mock.supported_models.return_value = ["haiku", "sonnet", "opus"]
@@ -53,6 +54,8 @@ def _make_mock_backend(name: str = "claude-code") -> MagicMock:
         backend_type=name,
     )
     mock.health_check.return_value = HealthStatus(alive=True, detail="mock check")
+    mock.capture.return_value = ""
+    mock.retain_pane_after_exit.return_value = None
     mock.kill.return_value = None
     return mock
 
@@ -297,6 +300,116 @@ class TestOneShotBackendRelay:
         assert inbox[0]["from"] == "codex-worker"
         assert inbox[0]["summary"] == "teammate_result"
         assert "codex pane-still-alive result" in inbox[0]["text"]
+
+    async def test_should_relay_generic_backend_via_pane_capture(self, client: Client):
+        await client.call_tool("team_create", {"team_name": "oneshot-generic"})
+
+        mock_gemini = _make_mock_backend("gemini")
+        mock_gemini.spawn.return_value = BackendSpawnResult(
+            process_handle="%gemini", backend_type="gemini"
+        )
+        mock_gemini.health_check.return_value = HealthStatus(
+            alive=False, detail="one-shot complete"
+        )
+        mock_gemini.capture.return_value = "gemini pane output here"
+        _registry._backends["gemini"] = mock_gemini
+
+        await client.call_tool(
+            "spawn_teammate",
+            {
+                "team_name": "oneshot-generic",
+                "name": "gemini-worker",
+                "backend": "gemini",
+                "model": "gemini-2.5-pro",
+                "prompt": "analyze code",
+            },
+        )
+
+        await asyncio.sleep(0.1)
+
+        inbox = _data(
+            await client.call_tool(
+                "read_inbox",
+                {
+                    "team_name": "oneshot-generic",
+                    "agent_name": "team-lead",
+                    "unread_only": True,
+                },
+            )
+        )
+        assert len(inbox) == 1
+        assert inbox[0]["from"] == "gemini-worker"
+        assert inbox[0]["summary"] == "teammate_result"
+        assert "gemini pane output here" in inbox[0]["text"]
+
+    async def test_should_strip_ansi_from_pane_capture(self, client: Client):
+        await client.call_tool("team_create", {"team_name": "oneshot-ansi"})
+
+        mock_gemini = _make_mock_backend("gemini")
+        mock_gemini.spawn.return_value = BackendSpawnResult(
+            process_handle="%gemini-ansi", backend_type="gemini"
+        )
+        mock_gemini.health_check.return_value = HealthStatus(alive=False, detail="done")
+        mock_gemini.capture.return_value = (
+            "\x1b[32mgreen output\x1b[0m with \x1b[1mbold\x1b[0m"
+        )
+        _registry._backends["gemini"] = mock_gemini
+
+        await client.call_tool(
+            "spawn_teammate",
+            {
+                "team_name": "oneshot-ansi",
+                "name": "gemini-worker",
+                "backend": "gemini",
+                "model": "gemini-2.5-pro",
+                "prompt": "analyze",
+            },
+        )
+
+        await asyncio.sleep(0.1)
+
+        inbox = _data(
+            await client.call_tool(
+                "read_inbox",
+                {
+                    "team_name": "oneshot-ansi",
+                    "agent_name": "team-lead",
+                    "unread_only": True,
+                },
+            )
+        )
+        assert len(inbox) == 1
+        assert "\x1b" not in inbox[0]["text"]
+        assert "green output" in inbox[0]["text"]
+        assert "bold" in inbox[0]["text"]
+
+    async def test_should_not_relay_for_interactive_backend(self, client: Client):
+        await client.call_tool("team_create", {"team_name": "oneshot-norelay"})
+
+        await client.call_tool(
+            "spawn_teammate",
+            {
+                "team_name": "oneshot-norelay",
+                "name": "claude-worker",
+                "backend": "claude-code",
+                "prompt": "do stuff",
+            },
+        )
+
+        await asyncio.sleep(0.1)
+
+        inbox = _data(
+            await client.call_tool(
+                "read_inbox",
+                {
+                    "team_name": "oneshot-norelay",
+                    "agent_name": "team-lead",
+                    "unread_only": True,
+                },
+            )
+        )
+        # Interactive backends handle their own messaging — no relay message
+        assert len(inbox) == 0
 
 
 # ---------------------------------------------------------------------------

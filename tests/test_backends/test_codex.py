@@ -34,6 +34,10 @@ class TestCodexProperties:
         backend = CodexBackend()
         assert backend.binary_name == "codex"
 
+    def test_is_not_interactive(self):
+        backend = CodexBackend()
+        assert backend.is_interactive is False
+
 
 class TestCodexSupportedModels:
     def test_returns_expected_models(self):
@@ -121,6 +125,15 @@ class TestCodexBuildCommand:
         assert "--output-last-message" in cmd
         idx = cmd.index("--output-last-message")
         assert cmd[idx + 1] == "/tmp/codex-last-message.txt"
+
+    @patch("claude_teams.backends.base.shutil.which", return_value="/usr/bin/codex")
+    def test_excludes_output_file_flag_when_no_extra(self, mock_which):
+        backend = CodexBackend()
+        request = _make_request()
+
+        cmd = backend.build_command(request)
+
+        assert "--output-last-message" not in cmd
 
 
 class TestCodexBuildEnv:

@@ -69,6 +69,32 @@ class Backend(Protocol):
         ...
 
     @property
+    def is_interactive(self) -> bool:
+        """Whether this backend supports native team messaging.
+
+        Interactive backends (e.g., claude-code) run as long-lived processes
+        that can send messages to the team-lead inbox directly via the MCP
+        messaging protocol.  Non-interactive (one-shot) backends run a
+        command and exit; their output must be relayed by the server.
+
+        Returns:
+            bool: True if the backend handles its own messaging.
+        """
+        ...
+
+    def retain_pane_after_exit(self, handle: str) -> None:
+        """Keep the process pane alive after the command exits.
+
+        Required for non-interactive backends so the server can capture
+        pane output after the process completes.  Without this, tmux
+        destroys the pane on exit and the output is lost.
+
+        Args:
+            handle (str): Backend-specific process handle (tmux pane ID).
+        """
+        ...
+
+    @property
     def binary_name(self) -> str:
         """Name of the CLI binary. E.g., 'claude', 'codex', 'gemini'.
 
@@ -320,6 +346,32 @@ class BaseBackend:
         """
         return self._binary_name
 
+    @property
+    def is_interactive(self) -> bool:
+        """Whether this backend supports native team messaging.
+
+        Most backends are one-shot CLIs whose output must be relayed by
+        the server.  Subclasses that handle their own messaging (e.g.,
+        claude-code) should override this to return ``True``.
+
+        Returns:
+            bool: False by default (one-shot / non-interactive).
+        """
+        return False
+
+    def retain_pane_after_exit(self, handle: str) -> None:
+        """Set ``remain-on-exit`` on the tmux pane so output survives process exit.
+
+        Without this, tmux destroys the pane when the command finishes and
+        the server loses the ability to capture output for relay.
+
+        Args:
+            handle (str): Tmux pane identifier.
+        """
+        self.controller._run_tmux_command(
+            ["set-option", "-p", "-t", handle, "remain-on-exit", "on"]
+        )
+
     def is_available(self) -> bool:
         """Return True if the backend binary is found on PATH.
 
@@ -387,20 +439,35 @@ class BaseBackend:
         return SpawnResult(process_handle=pane_id, backend_type=self._name)
 
     def health_check(self, handle: str) -> HealthStatus:
-        """Check if a spawned agent's tmux pane still exists.
+        """Check if a spawned agent's process is still running.
+
+        A pane may still exist after the process exits when
+        ``remain-on-exit`` is set (used for one-shot output capture).
+        This method checks both pane existence *and* the ``pane_dead``
+        tmux variable to report the true process state.
 
         Args:
             handle (str): Tmux pane identifier.
 
         Returns:
-            HealthStatus: Alive if pane exists, dead otherwise.
+            HealthStatus: Alive if process is running, dead otherwise.
         """
         panes = self.controller.list_panes()
-        alive = any(
+        pane_exists = any(
             handle in (pane.get("id", ""), pane.get("formatted_id", ""))
             for pane in panes
         )
-        return HealthStatus(alive=alive, detail="tmux pane check")
+        if not pane_exists:
+            return HealthStatus(alive=False, detail="tmux pane not found")
+
+        # Check if process exited but pane was retained (remain-on-exit).
+        output, code = self.controller._run_tmux_command(
+            ["display-message", "-t", handle, "-p", "#{pane_dead}"]
+        )
+        if code == 0 and output.strip() == "1":
+            return HealthStatus(alive=False, detail="process exited (pane retained)")
+
+        return HealthStatus(alive=True, detail="tmux pane check")
 
     def kill(self, handle: str) -> None:
         """Force-kill a spawned agent's tmux pane.

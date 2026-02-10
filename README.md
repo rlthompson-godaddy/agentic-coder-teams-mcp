@@ -4,7 +4,7 @@
 
 Multi-backend MCP server for orchestrating teams of agentic coding agents.
 
-**509 tests | 94% coverage | 17 backends | Python 3.12+**
+**521 tests | 92% coverage | 17 backends | Python 3.12+**
 
 </div>
 
@@ -90,7 +90,7 @@ Add to your project's `.mcp.json`:
   "mcpServers": {
     "claude-teams": {
       "command": "uvx",
-      "args": ["--from", "git+https://github.com/rlthompson-godaddy/agentic-coder-teams-mcp", "claude-teams"]
+      "args": ["--from", "git+https://github.com/rlthompson-godaddy/agentic-coder-teams-mcp", "claude-teams", "serve"]
     }
   }
 }
@@ -105,7 +105,7 @@ Add to `~/.config/opencode/opencode.json`:
   "mcp": {
     "claude-teams": {
       "type": "local",
-      "command": ["uvx", "--from", "git+https://github.com/rlthompson-godaddy/agentic-coder-teams-mcp", "claude-teams"],
+      "command": ["uvx", "--from", "git+https://github.com/rlthompson-godaddy/agentic-coder-teams-mcp", "claude-teams", "serve"],
       "enabled": true
     }
   }
@@ -117,7 +117,7 @@ Add to `~/.config/opencode/opencode.json`:
 The server speaks standard MCP over stdio. Point your client at:
 
 ```
-uvx --from git+https://github.com/rlthompson-godaddy/agentic-coder-teams-mcp claude-teams
+uvx --from git+https://github.com/rlthompson-godaddy/agentic-coder-teams-mcp claude-teams serve
 ```
 
 ---
@@ -273,10 +273,11 @@ JSON task files stored under `~/.claude/tasks/<team>/`. Tasks support:
 ~/.claude/
 ├── teams/<team-name>/
 │   ├── config.json          # Team config + member list
-│   └── inboxes/
-│       ├── team-lead.json   # Lead agent inbox
-│       ├── worker-1.json    # Teammate inboxes
-│       └── .lock
+│   ├── inboxes/
+│   │   ├── team-lead.json   # Lead agent inbox
+│   │   ├── worker-1.json    # Teammate inboxes
+│   │   └── .lock
+│   └── runs/                # One-shot backend result files (auto-cleaned)
 └── tasks/<team-name>/
     ├── 1.json               # Task files (auto-incrementing IDs)
     ├── 2.json
@@ -317,8 +318,8 @@ uv sync
 ### Running tests
 
 ```bash
-uv run pytest                           # Run all 509 tests
-uv run pytest --cov=claude_teams        # With coverage (94%)
+uv run pytest                           # Run all 521 tests
+uv run pytest --cov=claude_teams        # With coverage
 uv run pytest tests/test_server.py -v   # Single module
 uv run pytest -k "test_spawn"           # Filter by name
 ```
@@ -341,6 +342,7 @@ src/claude_teams/
 ├── teams.py           # Team CRUD (config read/write, member management)
 ├── tasks.py           # Task CRUD (create, update, list, dependencies)
 ├── messaging.py       # Inbox operations (read, write, structured messages)
+├── filelock.py        # Shared fcntl-based file locking
 ├── spawner.py         # Color assignment and spawn utilities
 └── backends/
     ├── base.py        # Backend protocol + BaseBackend (shared tmux lifecycle)
@@ -374,8 +376,8 @@ Example backend (minimal):
 from claude_teams.backends.base import BaseBackend, SpawnRequest
 
 class MyBackend(BaseBackend):
-    name = "my-tool"
-    binary_name = "mytool"
+    _name = "my-tool"
+    _binary_name = "mytool"
 
     def supported_models(self) -> list[str]:
         return ["default", "large"]
@@ -411,8 +413,8 @@ my-tool = "my_package.backend:MyBackend"
 
 1. Fork the repo and create a feature branch
 2. Add tests for new functionality
-3. Ensure all 509+ tests pass: `uv run pytest`
-4. Ensure coverage stays at or above 94%: `uv run pytest --cov=claude_teams`
+3. Ensure all tests pass: `uv run pytest`
+4. Ensure coverage stays above 90%: `uv run pytest --cov=claude_teams`
 5. Format and lint: `uv run ruff format && uv run ruff check`
 
 ---

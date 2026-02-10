@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import re
 import signal
 import time
 import uuid
@@ -32,10 +33,25 @@ from claude_teams.teams import _VALID_NAME_RE
 _TAG_BOOTSTRAP = "bootstrap"
 _TAG_TEAM = "team"
 _TAG_TEAMMATE = "teammate"
-_ONE_SHOT_BACKENDS = {"codex"}
 _ONE_SHOT_RESULT_MAX_CHARS = 12000
+_ONE_SHOT_TIMEOUT_S = 900
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07|\r")
 
 logger = logging.getLogger(__name__)
+
+
+def _strip_ansi(text: str) -> str:
+    """Remove ANSI escape sequences and carriage returns from text.
+
+    Used to clean tmux pane captures before relaying to team-lead.
+
+    Args:
+        text (str): Raw text potentially containing ANSI escape codes.
+
+    Returns:
+        str: Cleaned text with escape sequences removed.
+    """
+    return _ANSI_ESCAPE_RE.sub("", text)
 
 
 class _LifespanState(TypedDict):
@@ -124,6 +140,15 @@ async def team_delete(team_name: str, ctx: Context) -> dict:
     ls["has_teammates"] = False
     await ctx.disable_components(tags={_TAG_TEAM, _TAG_TEAMMATE}, components={"tool"})
     return result.model_dump()
+
+
+def _log_relay_task_exception(task: asyncio.Task) -> None:
+    """Log unhandled exceptions from one-shot relay background tasks."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error("One-shot relay task failed: %s", exc, exc_info=exc)
 
 
 @mcp.tool(name="spawn_teammate", tags={_TAG_TEAM})
@@ -215,7 +240,9 @@ async def spawn_teammate_tool(
     # Spawn via backend
     extra: dict[str, str] | None = None
     one_shot_result_path: Path | None = None
-    if backend_obj.name in _ONE_SHOT_BACKENDS:
+
+    # Codex supports file-based output capture via --output-last-message
+    if backend_obj.name == "codex":
         one_shot_result_path = _create_one_shot_result_path(team_name, name)
         extra = {"output_last_message_path": str(one_shot_result_path)}
 
@@ -251,8 +278,15 @@ async def spawn_teammate_tool(
         ls["has_teammates"] = True
         await ctx.enable_components(tags={_TAG_TEAMMATE}, components={"tool"})
 
-    if one_shot_result_path is not None:
-        asyncio.create_task(
+    # Start result relay for all non-interactive (one-shot) backends.
+    # Interactive backends (e.g. claude-code) handle their own messaging.
+    if not backend_obj.is_interactive:
+        # Keep the tmux pane alive after exit so we can capture its output.
+        try:
+            backend_obj.retain_pane_after_exit(spawn_result.process_handle)
+        except Exception:
+            logger.debug("Failed to set remain-on-exit for %s", name, exc_info=True)
+        relay_task = asyncio.create_task(
             _relay_one_shot_result(
                 team_name=team_name,
                 agent_name=name,
@@ -262,6 +296,7 @@ async def spawn_teammate_tool(
                 color=color,
             )
         )
+        relay_task.add_done_callback(_log_relay_task_exception)
 
     return SpawnResult(
         agent_id=member.agent_id,
@@ -551,12 +586,27 @@ def read_config(team_name: str) -> dict:
     return config.model_dump(by_alias=True)
 
 
-@mcp.tool(tags={_TAG_TEAMMATE})
-def force_kill_teammate(team_name: str, agent_name: str) -> dict:
-    """Forcibly kill a teammate. Uses the teammate's registered backend to
-    perform the kill. Removes member from config and resets their tasks.
+def _resolve_teammate(
+    team_name: str, agent_name: str
+) -> tuple[TeammateMember, str | None, str]:
+    """Look up a teammate and resolve process handle and backend type.
+
+    Args:
+        team_name (str): Name of the team.
+        agent_name (str): Name of the teammate.
+
+    Returns:
+        tuple[TeammateMember, str | None, str]: The member, process handle,
+            and normalised backend type.
+
+    Raises:
+        ToolError: If team or teammate is not found.
     """
-    config = teams.read_config(team_name)
+    try:
+        config = teams.read_config(team_name)
+    except FileNotFoundError:
+        raise ToolError(f"Team {team_name!r} not found")
+
     member = None
     for config_member in config.members:
         if (
@@ -574,6 +624,16 @@ def force_kill_teammate(team_name: str, agent_name: str) -> dict:
     # Fallback: legacy "tmux" backend_type maps to "claude-code"
     if backend_type == "tmux":
         backend_type = "claude-code"
+
+    return member, process_handle, backend_type
+
+
+@mcp.tool(tags={_TAG_TEAMMATE})
+def force_kill_teammate(team_name: str, agent_name: str) -> dict:
+    """Forcibly kill a teammate. Uses the teammate's registered backend to
+    perform the kill. Removes member from config and resets their tasks.
+    """
+    _member, process_handle, backend_type = _resolve_teammate(team_name, agent_name)
 
     if process_handle:
         try:
@@ -651,28 +711,10 @@ def health_check(team_name: str, agent_name: str, ctx: Context) -> dict:
     """Check if a teammate's process is still running.
     Uses the teammate's registered backend for the health check.
     """
-    try:
-        config = teams.read_config(team_name)
-    except FileNotFoundError:
-        raise ToolError(f"Team {team_name!r} not found")
+    _member, process_handle, backend_type = _resolve_teammate(team_name, agent_name)
 
-    member = None
-    for config_member in config.members:
-        if (
-            isinstance(config_member, TeammateMember)
-            and config_member.name == agent_name
-        ):
-            member = config_member
-            break
-    if member is None:
-        raise ToolError(f"Teammate {agent_name!r} not found in team {team_name!r}")
-
-    process_handle = member.process_handle or member.tmux_pane_id
-    backend_type = member.backend_type
-
-    # Fallback: legacy "tmux" backend_type maps to "claude-code"
-    if backend_type == "tmux":
-        backend_type = "claude-code"
+    if not process_handle:
+        raise ToolError(f"No process handle for teammate {agent_name!r}")
 
     try:
         backend_obj = registry.get(backend_type)
@@ -700,10 +742,30 @@ async def _relay_one_shot_result(
     agent_name: str,
     backend_type: str,
     process_handle: str,
-    result_file: Path,
+    result_file: Path | None,
     color: str,
 ) -> None:
-    deadline = time.time() + 900
+    """Wait for a one-shot backend to finish and relay its output to team-lead.
+
+    Collects the result using two strategies in priority order:
+
+    1. **File-based** (preferred) — backends like Codex write their final
+       message to ``result_file`` via ``--output-last-message``.  If the file
+       contains text it is used directly.
+    2. **Tmux pane capture** (universal fallback) — after the process exits,
+       the tmux pane buffer is captured and ANSI-stripped.  Works for every
+       backend that runs in a tmux pane.
+
+    Args:
+        team_name (str): Name of the team.
+        agent_name (str): Name of the teammate agent.
+        backend_type (str): Backend identifier (e.g. ``"codex"``, ``"gemini"``).
+        process_handle (str): Tmux pane identifier for health checks / capture.
+        result_file (Path | None): Optional file path for file-based output.
+            ``None`` for backends that do not support file-based output.
+        color (str): Agent display color for inbox messages.
+    """
+    deadline = time.time() + _ONE_SHOT_TIMEOUT_S
     backend_obj = None
     text = ""
 
@@ -714,39 +776,51 @@ async def _relay_one_shot_result(
             "One-shot backend not available for result relay: %s", backend_type
         )
 
+    # Phase 1: Poll until file appears, process dies, or timeout.
     while time.time() < deadline:
-        try:
-            if result_file.exists():
-                text = result_file.read_text().strip()
-        except Exception:
-            logger.exception("Failed reading one-shot result file: %s", result_file)
+        if result_file is not None:
+            try:
+                if result_file.exists():
+                    text = result_file.read_text().strip()
+            except Exception:
+                logger.exception("Failed reading one-shot result file: %s", result_file)
+            if text:
+                break
 
-        if text:
-            break
-
-        if backend_obj is None:
-            await asyncio.sleep(0.5)
-            continue
-
-        status = backend_obj.health_check(process_handle)
-        if not status.alive:
-            break
+        if backend_obj is not None:
+            status = backend_obj.health_check(process_handle)
+            if not status.alive:
+                break
 
         await asyncio.sleep(0.5)
 
-    if not text:
+    # Phase 2: Collect result — try file first, then pane capture.
+    if not text and result_file is not None:
         try:
             if result_file.exists():
                 text = result_file.read_text().strip()
         except Exception:
             logger.exception("Failed reading one-shot result file: %s", result_file)
 
+    if not text and backend_obj is not None:
+        try:
+            captured = backend_obj.capture(process_handle)
+            text = _strip_ansi(captured).strip()
+        except Exception:
+            logger.debug(
+                "Failed to capture pane output for %s: %s",
+                agent_name,
+                process_handle,
+                exc_info=True,
+            )
+
+    # Phase 3: Relay result or report failure.
     if not text and time.time() >= deadline:
         messaging.send_plain_message(
             team_name,
             agent_name,
             "team-lead",
-            f"{agent_name} timed out before producing a one-shot result.",
+            f"{agent_name} timed out before producing output.",
             summary="teammate_timeout",
             color=color,
         )
@@ -766,6 +840,19 @@ async def _relay_one_shot_result(
         summary="teammate_result",
         color=color,
     )
+
+    if result_file is not None:
+        try:
+            result_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    # Clean up the retained pane (remain-on-exit keeps it alive after exit).
+    if backend_obj is not None:
+        try:
+            backend_obj.kill(process_handle)
+        except Exception:
+            pass
 
 
 def main():
