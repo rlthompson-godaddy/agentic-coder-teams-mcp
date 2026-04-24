@@ -41,6 +41,7 @@ from claude_teams.server_runtime import (
     _require_sender_or_lead,
     _resolve_permission_mode,
     _resolve_spawn_cwd,
+    apply_spawn_env_defaults,
 )
 from claude_teams.server_schema import (
     AgentName,
@@ -86,6 +87,7 @@ def _build_spawn_dependencies() -> SpawnDependencies:
     precisely so those imports — and their types — stay on this side.
     """
     return SpawnDependencies(
+        apply_env_defaults=apply_spawn_env_defaults,
         resolve_permission_mode=_resolve_permission_mode,
         resolve_spawn_cwd=_resolve_spawn_cwd,
         build_agent_auth_notice=build_agent_auth_notice,

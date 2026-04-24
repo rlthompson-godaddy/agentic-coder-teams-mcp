@@ -130,6 +130,12 @@ class SpawnDependencies:
     import those MCP-facing modules.
 
     Attributes:
+        apply_env_defaults: Fills ``SpawnOptions`` fields the caller did
+            not explicitly set from ``CLAUDE_TEAMS_DEFAULT_*`` env vars.
+            Runs before :func:`apply_template` so the precedence chain is
+            ``direct → env → template → pydantic default``. Injected so
+            both the MCP spawn path and the CLI preset-expansion path
+            apply the same defaults without the core reading env directly.
         resolve_permission_mode: Normalizes the caller-provided
             permission mode against the environment default.
         resolve_spawn_cwd: Validates a spawn cwd and returns the
@@ -151,6 +157,7 @@ class SpawnDependencies:
 
     """
 
+    apply_env_defaults: Callable[[SpawnOptions], SpawnOptions]
     resolve_permission_mode: Callable[[PermissionMode | None], PermissionMode]
     resolve_spawn_cwd: Callable[[str], str]
     build_agent_auth_notice: Callable[[str, str], str]
@@ -385,7 +392,8 @@ async def spawn_teammate_core(
             before the error propagates.
 
     """
-    opts, prompt = apply_template(options, prompt)
+    opts = deps.apply_env_defaults(options)
+    opts, prompt = apply_template(opts, prompt)
 
     backend_obj = _resolve_backend(registry, opts.backend)
 

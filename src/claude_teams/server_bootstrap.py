@@ -7,6 +7,7 @@ from claude_teams import capabilities, presets, teams, templates
 from claude_teams.errors import (
     BackendNotRegisteredError,
     InvalidCapabilityError,
+    NoBackendsAvailableError,
     SessionActiveTeamError,
     TeamAlreadyExistsError,
     TeamAlreadyExistsToolError,
@@ -36,6 +37,9 @@ from claude_teams.server_runtime import (
     _clear_session_principal,
     _get_lifespan,
     _require_lead,
+    _resolve_backend_name,
+    _resolve_capability,
+    _resolve_description,
     _resolve_spawn_cwd,
     _set_session_principal,
 )
@@ -61,7 +65,9 @@ async def team_create(
         raise SessionActiveTeamError(active_team)
     try:
         result = await teams.create_team(
-            name=team_name, session_id=ctx.session_id, description=description
+            name=team_name,
+            session_id=ctx.session_id,
+            description=_resolve_description(description),
         )
     except TeamAlreadyExistsError as exc:
         raise TeamAlreadyExistsToolError(team_name) from exc
@@ -88,7 +94,8 @@ async def team_attach(
     ctx: Context,
 ) -> dict[str, object]:
     """Attach this MCP session to an existing team as lead or agent."""
-    principal = await capabilities.resolve_principal(team_name, capability)
+    resolved_capability = _resolve_capability(capability)
+    principal = await capabilities.resolve_principal(team_name, resolved_capability)
     if principal is None:
         raise InvalidCapabilityError()
 
@@ -101,7 +108,7 @@ async def team_attach(
         team_name,
         principal["name"],
         principal["role"],
-        lead_capability=capability if principal["role"] == "lead" else None,
+        lead_capability=resolved_capability if principal["role"] == "lead" else None,
     )
     await ctx.enable_components(tags={_TAG_TEAM}, components={"tool", "prompt"})
     if await ctx.get_state("has_teammates"):
@@ -168,13 +175,25 @@ def list_agents(
 
     Returns ``supported=False`` when the backend has no agent-selection
     mechanism; otherwise enumerates profiles visible from ``cwd`` (empty
-    string resolves to the server's working directory).
+    string resolves to the server's working directory). Both
+    ``backend_name`` and ``cwd`` fall back to their ``CLAUDE_TEAMS_DEFAULT_*``
+    env vars when the caller leaves them empty.
+
+    An empty ``backend_name`` after env fallback selects the registry's
+    default backend — mirroring the documented ``BackendName`` contract
+    and the behaviour of :func:`claude_teams.orchestration._resolve_backend`
+    on the spawn path. The concrete backend actually queried is reported
+    back on ``AgentListResult.backend`` so clients can tell which one was
+    resolved.
     """
     ls = _get_lifespan(ctx)
     reg = ls["registry"]
+    resolved_backend = _resolve_backend_name(backend_name)
     try:
-        backend_obj = reg.get(backend_name)
-    except BackendNotRegisteredError as exc:
+        if not resolved_backend:
+            resolved_backend = reg.default_backend()
+        backend_obj = reg.get(resolved_backend)
+    except (NoBackendsAvailableError, BackendNotRegisteredError) as exc:
         raise ToolError(str(exc)) from exc
 
     resolved_cwd = str(_resolve_spawn_cwd(cwd))
@@ -182,7 +201,7 @@ def list_agents(
     spec = backend_obj.agent_select_spec()
     if spec is None:
         return AgentListResult(
-            backend=backend_name,
+            backend=resolved_backend,
             supported=False,
             cwd=resolved_cwd,
             profiles=[],
@@ -190,7 +209,7 @@ def list_agents(
 
     profiles = backend_obj.discover_agents(resolved_cwd)
     return AgentListResult(
-        backend=backend_name,
+        backend=resolved_backend,
         supported=True,
         cwd=resolved_cwd,
         profiles=[AgentProfileInfo(name=p.name, path=p.path) for p in profiles],
@@ -234,7 +253,7 @@ async def create_team_from_preset(
     except KeyError as exc:
         raise UnknownPresetToolError(preset_name, presets.list_names()) from exc
 
-    effective_description = description or preset.team_description
+    effective_description = _resolve_description(description) or preset.team_description
 
     ls = _get_lifespan(ctx)
     reg = ls["registry"]

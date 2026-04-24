@@ -435,6 +435,20 @@ class InvalidPermissionModeError(ToolError):
         )
 
 
+class InvalidEnvVarValueError(ToolError):
+    """Raised when an env-var-driven default cannot be coerced to the target type.
+
+    Fires from the ``CLAUDE_TEAMS_DEFAULT_*`` precedence layer when an operator
+    sets an env var to a value the resolver cannot accept (e.g. non-boolean text
+    for a boolean field). Surfaced as ``ToolError`` because the failure happens
+    at tool-entry while resolving the precedence chain.
+    """
+
+    def __init__(self, env_var: str, raw: str, hint: str) -> None:
+        """Build the message from the env-var name, bad value, and remediation hint."""
+        super().__init__(f"Invalid value for {env_var}={raw!r}: {hint}.")
+
+
 class PaginationLimitTooSmallError(ToolError):
     """Raised when a pagination ``limit`` is less than 1."""
 

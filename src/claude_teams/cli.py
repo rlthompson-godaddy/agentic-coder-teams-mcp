@@ -40,7 +40,13 @@ from claude_teams.errors import (
 from claude_teams.models import TeammateMember
 from claude_teams.orchestration import SpawnDependencies, expand_preset_core
 from claude_teams.server import mcp
-from claude_teams.server_runtime import _resolve_permission_mode, _resolve_spawn_cwd
+from claude_teams.server_runtime import (
+    _resolve_capability,
+    _resolve_description,
+    _resolve_permission_mode,
+    _resolve_spawn_cwd,
+    apply_spawn_env_defaults,
+)
 from claude_teams.server_team_relay import (
     build_agent_auth_notice,
     create_one_shot_result_path,
@@ -82,10 +88,6 @@ CapabilityFlag = Annotated[
 ]
 
 
-def _resolved_capability(capability: str) -> str:
-    return capability or os.environ.get("CLAUDE_TEAMS_CAPABILITY", "")
-
-
 def _run(awaitable):
     """Run an awaitable from the synchronous CLI surface.
 
@@ -113,7 +115,7 @@ def _ensure_team_exists(team_name: str) -> None:
 def _require_cli_principal(team_name: str, capability: str) -> capabilities.Principal:
     _ensure_team_exists(team_name)
     principal = _run(
-        capabilities.resolve_principal(team_name, _resolved_capability(capability))
+        capabilities.resolve_principal(team_name, _resolve_capability(capability))
     )
     if principal is None:
         err_console.print(
@@ -641,6 +643,7 @@ def _build_cli_spawn_dependencies() -> SpawnDependencies:
     results behaviorally equivalent for the same inputs.
     """
     return SpawnDependencies(
+        apply_env_defaults=apply_spawn_env_defaults,
         resolve_permission_mode=_resolve_permission_mode,
         resolve_spawn_cwd=_resolve_spawn_cwd,
         build_agent_auth_notice=build_agent_auth_notice,
@@ -694,7 +697,7 @@ def preset_launch(
         )
         raise typer.Exit(code=1) from None
 
-    effective_description = description or preset.team_description
+    effective_description = _resolve_description(description) or preset.team_description
     session_id = f"cli-{uuid.uuid4().hex}"
 
     try:
